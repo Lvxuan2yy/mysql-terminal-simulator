@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MySQL 终端模拟器 · 离线单文件版</title>
+<meta name="description" content="在浏览器中模拟 Linux 下的 mysql 命令行：MySQL 8.0 方言兼容、SHOW/DESC 元数据、MySQL 风格错误码与表格排版。纯本地运行，无需联网。">
+<style>
+/*__CSS__*/
+</style>
+</head>
+<body>
+
+<!-- 启动自检守卫：这段刻意做得极小且放在文件最前面，保证只要文件开头完好就能生效。
+     用途：文件在下载/复制/发送过程中被截断时，避免页面永远停在「正在初始化 MySQL 引擎…」，
+     而不给用户任何线索。启动流程一旦有结论（成功或失败）都会置 __BOOT_SETTLED。 -->
+<script>
+(function () {
+  var t0 = Date.now(), LIMIT = 15000;
+  var timer = setInterval(function () {
+    if (window.__BOOT_SETTLED) { clearInterval(timer); return; }
+    if (Date.now() - t0 < LIMIT) return;
+    clearInterval(timer);
+    var b = document.getElementById('boot');
+    if (!b) return;
+    var msg = window.__SQLJS_WASM_B64
+      ? '内置引擎数据已读到，但启动流程没有跑完——这个 HTML 文件很可能在下载 / 复制 / 发送过程中不完整（正常约 1 MB）。请重新获取一份完整的文件后再打开。'
+      : '没能读到内置引擎数据——这个 HTML 文件很可能在下载 / 复制 / 发送过程中被截断（正常约 1 MB）。请重新获取一份完整的文件后再打开。';
+    b.className = 'boot err';
+    b.innerHTML = '<div>⚠️ 工具未能启动</div>'
+      + '<div style="max-width:620px;text-align:center;line-height:1.8">' + msg
+      + '<br><br>若确认文件完整，请改用 Chrome / Edge / Firefox / 新版 Safari 打开；'
+      + '用 360、QQ、搜狗等双核浏览器时，请把内核切到「极速模式」。</div>';
+  }, 1000);
+})();
+</script>
+
+<div class="app">
+  <header class="topbar">
+    <div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+    <div class="brand">
+      <b>MySQL 终端模拟器</b>
+      <span>mysql&nbsp;Ver 8.0.36-sim · 离线单文件</span>
+    </div>
+    <div class="spacer"></div>
+    <div class="conn" id="conn"><i class="led"></i><span id="connText">root@localhost:3306</span></div>
+    <div class="actions">
+      <button class="btn" id="btn-about">关于</button>
+      <button class="btn" id="btn-help">帮助</button>
+      <button class="btn on" id="btn-side">侧栏</button>
+      <button class="btn" id="btn-clear">清屏</button>
+      <button class="btn" id="btn-reconnect">重新连接</button>
+    </div>
+  </header>
+
+  <div class="main">
+    <div class="term-wrap">
+      <div class="term" id="term">
+        <div class="term-head">
+          <span class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></span>
+          <span>root@localhost &nbsp;/var/run/mysqld/mysqld.sock</span>
+          <span class="tag">SQLite 3.49 · WebAssembly · 全程本地运行</span>
+        </div>
+        <div class="scroll" id="scroll"></div>
+        <div class="inputline" id="inputline">
+          <span class="prompt" id="prompt">mysql&gt; </span>
+          <span class="input" id="input"></span>
+        </div>
+      </div>
+      <input class="hidden-input" id="hidden" autocomplete="off" autocorrect="off"
+             autocapitalize="off" spellcheck="false" aria-label="SQL 输入框">
+    </div>
+
+    <aside class="side" id="side">
+      <div class="tabs">
+        <button class="tab on" data-panel="db">数据库</button>
+        <button class="tab" data-panel="ex">练习</button>
+        <button class="tab" data-panel="diff">差异</button>
+        <button class="tab" data-panel="help">帮助</button>
+      </div>
+      <div class="panels">
+        <div class="panel on" id="panel-db">
+          <div class="sec-title">数据库（点击切换）</div>
+          <div class="dblist" id="dblist"></div>
+          <div class="sec-title" id="tbltitle">当前库中的表</div>
+          <div class="tbllist" id="tbllist"></div>
+        </div>
+        <div class="panel" id="panel-ex">
+          <div class="pane-note">共 24 道练习，覆盖基础 / 进阶 / 挑战三档。点「答案」可查看参考答案；当你的写法和参考答案（忽略大小写与多余空格）一致并执行成功时，本道题会自动打勾。进度存在浏览器本地。</div>
+          <div id="ex-list"></div>
+        </div>
+        <div class="panel" id="panel-diff"><div id="diff"></div></div>
+        <div class="panel" id="panel-help"><pre class="help" id="help"></pre></div>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<div class="boot" id="boot">
+  <div>正在初始化 MySQL 引擎…</div>
+  <div class="bar"><i></i></div>
+</div>
+
+<!-- ============ 以下为内嵌引擎与逻辑，全部本地，无任何外部请求 ============ -->
+<script>/*__SQLJS__*/</script>
+<script>window.__SQLJS_WASM_B64="__WASM__";</script>
+<script>/*__CORE__*/</script>
+<script>/*__APP__*/</script>
+</body>
+</html>
