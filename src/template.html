@@ -69,12 +69,15 @@
       </div>
       <input class="hidden-input" id="hidden" autocomplete="off" autocorrect="off"
              autocapitalize="off" spellcheck="false" aria-label="SQL 输入框">
+      <input type="file" id="file-picker" accept=".sql,.txt,text/plain" style="display:none"
+             aria-label="选择要导入的 SQL 脚本">
     </div>
 
     <aside class="side" id="side">
       <div class="tabs">
         <button class="tab on" data-panel="db">数据库</button>
         <button class="tab" data-panel="ex">练习</button>
+        <button class="tab" data-panel="tool">工具</button>
         <button class="tab" data-panel="diff">差异</button>
         <button class="tab" data-panel="help">帮助</button>
       </div>
@@ -86,8 +89,27 @@
           <div class="tbllist" id="tbllist"></div>
         </div>
         <div class="panel" id="panel-ex">
-          <div class="pane-note">共 24 道练习，覆盖基础 / 进阶 / 挑战三档。点「答案」可查看参考答案；当你的写法和参考答案（忽略大小写与多余空格）一致并执行成功时，本道题会自动打勾。进度存在浏览器本地。</div>
+          <div class="pane-note" id="ex-note"></div>
           <div id="ex-list"></div>
+        </div>
+        <div class="panel" id="panel-tool">
+          <div class="sec-title">导出上一个查询结果</div>
+          <div class="pane-note" id="tool-result-note">执行一条 SELECT 之后，可以把结果导出成 CSV 或 JSON 文件。文件在本地生成，不联网、不上传。</div>
+          <div class="toolrow">
+            <button class="mini" id="btn-csv">导出 CSV</button>
+            <button class="mini" id="btn-json">导出 JSON</button>
+          </div>
+          <div class="sec-title">导出当前数据库为 SQL 脚本</div>
+          <div class="pane-note">把当前库的表结构（建表语句）、数据（INSERT）和视图定义导出成一个 .sql 文本，方便保存或换台电脑重放。</div>
+          <div class="toolrow">
+            <button class="mini" id="btn-dump">导出 SQL 脚本</button>
+          </div>
+          <div class="sec-title">导入 SQL 脚本</div>
+          <div class="pane-note">选择本地 .sql / .txt 文件，逐条执行里面的语句。执行失败的语句会在终端里以 MySQL 风格报错显示，成功的只做汇总，不刷屏。</div>
+          <div class="toolrow">
+            <button class="mini" id="btn-import">选择文件并导入</button>
+          </div>
+          <div class="tool-note" id="import-status"></div>
         </div>
         <div class="panel" id="panel-diff"><div id="diff"></div></div>
         <div class="panel" id="panel-help"><pre class="help" id="help"></pre></div>

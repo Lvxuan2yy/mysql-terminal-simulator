@@ -305,7 +305,13 @@ var MySQLCore = (function () {
       });
     });
 
-    return { name: name, columns: columns, indexes: indexes, foreignKeys: foreignKeys, raw: sql.replace(/\s*\n\s*/g, '\n').trim() };
+    // 表级 AUTO_INCREMENT = N（只在表选项里出现，列定义里的 AUTO_INCREMENT 没有等号）
+    var aiM = /\bAUTO_INCREMENT\s*=\s*(\d+)/i.exec(sql);
+    return {
+      name: name, columns: columns, indexes: indexes, foreignKeys: foreignKeys,
+      autoIncrementNext: aiM ? Number(aiM[1]) : null,
+      raw: sql.replace(/\s*\n\s*/g, '\n').trim()
+    };
   }
 
   /* ======================= 4. MySQL → SQLite 方言转译 ======================= */
@@ -446,14 +452,248 @@ var MySQLCore = (function () {
     return out;
   }
 
+  var GROUP_CONCAT_DISTINCT_NOTE = '（提示：GROUP_CONCAT(DISTINCT x SEPARATOR s) 在底层是"先按逗号拼接、再把逗号替换成分隔符"实现的，'
+    + '所以当 x 的值本身含逗号时结果会与真实 MySQL 有出入；去掉 DISTINCT 即可完全一致。）';
+
+  /**
+   * 在引号与注释之外做替换（比 replaceOutsideQuotes 多认 `--` / `#` / 块注释）。
+   * 必须认注释，否则 `/* a / b *​/` 这类注释里的除号会被误改成 `*1.0/`。
+   * fn(str, i) 返回 { text, len } 表示在 i 处替换掉 len 个字符；返回 null 表示不动。
+   */
+  function mapOutsideQuotesAndComments(str, fn) {
+    var out = '', i = 0, state = 'n';
+    while (i < str.length) {
+      var ch = str.charAt(i), nx = str.charAt(i + 1);
+      if (state === 'n') {
+        if (ch === "'" || ch === '"' || ch === '`') {
+          state = ch === "'" ? 's' : ch === '"' ? 'd' : 'b';
+          out += ch; i++; continue;
+        }
+        if (ch === '-' && nx === '-') { state = 'l'; out += '--'; i += 2; continue; }
+        if (ch === '#') { state = 'l'; out += ch; i++; continue; }
+        if (ch === '/' && nx === '*') { state = 'c'; out += '/*'; i += 2; continue; }
+        var rep = fn(str, i);
+        if (rep) { out += rep.text; i += rep.len; continue; }
+        out += ch; i++; continue;
+      }
+      out += ch;
+      if (state === 'l') { if (ch === '\n') state = 'n'; i++; continue; }
+      if (state === 'c') {
+        if (ch === '*' && nx === '/') { out += '/'; i += 2; state = 'n'; continue; }
+        i++; continue;
+      }
+      var q = state === 's' ? "'" : state === 'd' ? '"' : '`';
+      if (ch === '\\' && state !== 'b') { out += str.charAt(i + 1); i += 2; continue; }
+      if (ch === q) { if (nx === q) { out += q; i += 2; continue; } state = 'n'; }
+      i++;
+    }
+    return out;
+  }
+
+  /** 在引号/注释之外用"位置锚定"的正则替换（rx 需要带 g 标志） */
+  function replaceOutsideAll(str, rx, fn) {
+    return mapOutsideQuotesAndComments(str, function (s2, i) {
+      rx.lastIndex = i;
+      var m = rx.exec(s2);
+      if (m && m.index === i) return { text: fn.apply(null, m), len: m[0].length };
+      return null;
+    });
+  }
+
+  /**
+   * GROUP_CONCAT 的 SEPARATOR 重写。
+   *
+   * SQLite 的正确写法是 `group_concat(expr, sep [ORDER BY ...])`（分隔符要放在 ORDER BY 之前），
+   * 而 MySQL 习惯写成 `group_concat(expr [ORDER BY ...] SEPARATOR 'sep')`。
+   * 旧实现只是把 `SEPARATOR x` 换成第二个实参，于是：
+   *   · 带 DISTINCT 时 → SQLite 直接报 "DISTINCT aggregates must have exactly one argument"
+   *   · 带 ORDER BY 时 → 分隔符被 SQLite 忽略，静默改用逗号
+   */
+  function rewriteGroupConcat(sql, ctx) {
+    var s = String(sql), out = '', idx = 0;
+    while (idx < s.length) {
+      var rel = indexOfFunctionCall(s.slice(idx), 'GROUP_CONCAT');
+      if (rel < 0) { out += s.slice(idx); break; }
+      var at = idx + rel;
+      var open = s.indexOf('(', at);
+      var close = open < 0 ? -1 : matchParen(s, open);
+      if (close < 0) { out += s.slice(idx); break; }
+      out += s.slice(idx, at);
+      var inner = s.slice(open + 1, close);
+      var mSep = /^([\s\S]*?)\s+SEPARATOR\s+('(?:[^']|'')*'|"(?:[^"]|"")*")\s*$/i.exec(inner);
+      if (!mSep) {
+        out += 'GROUP_CONCAT(' + inner + ')';
+        idx = close + 1;
+        continue;
+      }
+      var body = mSep[1].trim(), sep = mSep[2];
+      var ordM = /\s+ORDER\s+BY\s+([\s\S]+)$/i.exec(body);
+      var ord = ordM ? ordM[1].trim() : null;
+      var core = ordM ? body.slice(0, ordM.index).trim() : body;
+      if (/^DISTINCT\s+/i.test(core)) {
+        if (ctx) {
+          ctx.notes = ctx.notes || [];
+          if (ctx.notes.indexOf(GROUP_CONCAT_DISTINCT_NOTE) < 0) ctx.notes.push(GROUP_CONCAT_DISTINCT_NOTE);
+        }
+        out += 'REPLACE(GROUP_CONCAT(' + core + (ord ? ' ORDER BY ' + ord : '') + '), \',\', ' + sep + ')';
+      } else {
+        out += 'GROUP_CONCAT(' + core + ', ' + sep + (ord ? ' ORDER BY ' + ord : '') + ')';
+      }
+      idx = close + 1;
+    }
+    return out;
+  }
+
+  /** 通用函数调用重写：把 f(...) 的实参交给 build(argsArray, rawArgs) 生成替换文本；返回 null 表示不改 */
+  function rewriteFunctionCalls(sql, name, build) {
+    var s = String(sql), out = '', idx = 0, guard = 0;
+    while (idx < s.length && guard++ < 500) {
+      var rel = indexOfFunctionCall(s.slice(idx), name);
+      if (rel < 0) { out += s.slice(idx); break; }
+      var at = idx + rel;
+      var open = s.indexOf('(', at);
+      var close = open < 0 ? -1 : matchParen(s, open);
+      if (close < 0) { out += s.slice(idx); break; }
+      out += s.slice(idx, at);
+      var raw = s.slice(open + 1, close);
+      var rep = build(splitTopLevel(raw), raw);
+      out += (rep === null || rep === undefined) ? s.slice(at, close + 1) : rep;
+      idx = close + 1;
+    }
+    return out;
+  }
+
+  /** ISNULL(expr) → (expr IS NULL)：SQLite 里 ISNULL 是后缀运算符，直接当函数调用会语法错误 */
+  function rewriteIsNull(sql) {
+    return rewriteFunctionCalls(sql, 'ISNULL', function (args, raw) {
+      var a = splitTopLevel(raw);
+      if (a.length !== 1) return null;
+      return '((' + a[0].trim() + ') IS NULL)';
+    });
+  }
+
+  /** TRIM([BOTH|LEADING|TRAILING] [remstr] FROM str) → LTRIM/RTRIM/TRIM(str, remstr) */
+  function rewriteTrim(sql) {
+    return rewriteFunctionCalls(sql, 'TRIM', function (args, raw) {
+      var m = /^\s*(BOTH|LEADING|TRAILING)?\s*([\s\S]*?)\s+FROM\s+([\s\S]+)$/i.exec(raw);
+      if (!m) return null;                       // 普通 TRIM(str) / TRIM(str, chars) 交给底层
+      var dir = (m[1] || 'BOTH').toUpperCase();
+      var rem = m[2].trim(), str = m[3].trim();
+      if (!rem) return str;
+      if (dir === 'LEADING') return 'LTRIM(' + str + ', ' + rem + ')';
+      if (dir === 'TRAILING') return 'RTRIM(' + str + ', ' + rem + ')';
+      return 'TRIM(' + str + ', ' + rem + ')';
+    });
+  }
+
+  /** POSITION(substr IN str) → INSTR(str, substr) */
+  function rewritePosition(sql) {
+    return rewriteFunctionCalls(sql, 'POSITION', function (args, raw) {
+      var m = /^([\s\S]+?)\s+IN\s+([\s\S]+)$/i.exec(raw);
+      if (!m) return null;
+      return 'INSTR(' + m[2].trim() + ', ' + m[1].trim() + ')';
+    });
+  }
+
+  /** CONVERT(expr, type) → CAST(expr AS ...)；CONVERT(expr USING cs) → expr（字符集在此为空操作） */
+  function rewriteConvert(sql) {
+    return rewriteFunctionCalls(sql, 'CONVERT', function (args, raw) {
+      var mUsing = /^([\s\S]+?)\s+USING\s+[A-Za-z0-9_]+\s*$/i.exec(raw);
+      if (mUsing) return mUsing[1].trim();
+      var m = /^([\s\S]+?),\s*([A-Za-z]+(?:\s*\([\d,\s]+\))?)\s*$/i.exec(raw);
+      if (!m) return null;
+      var t = m[2].toUpperCase();
+      var cast = /^(SIGNED|UNSIGNED)/.test(t) ? 'INTEGER'
+        : /^(DECIMAL|NUMERIC|FLOAT|DOUBLE|REAL)/.test(t) ? 'REAL'
+        : 'TEXT';
+      return 'CAST(' + m[1].trim() + ' AS ' + cast + ')';
+    });
+  }
+
+  /** EXTRACT(unit FROM expr) */
+  function rewriteExtract(sql) {
+    return rewriteFunctionCalls(sql, 'EXTRACT', function (args, raw) {
+      var m = /^\s*([A-Za-z_]+)\s+FROM\s+([\s\S]+)$/i.exec(raw);
+      if (!m) return null;
+      var unit = m[1].toUpperCase(), e = m[2].trim();
+      if (unit === 'DATE') return 'date(' + e + ')';
+      if (unit === 'TIME') return 'time(' + e + ')';
+      if (unit === 'QUARTER') return 'CAST(((CAST(strftime(\'%m\',' + e + ') AS INTEGER)+2)/3) AS INTEGER)';
+      if (unit === 'WEEK') return 'CAST(strftime(\'%W\',' + e + ') AS INTEGER)';
+      if (unit === 'DAYOFYEAR') return 'CAST(strftime(\'%j\',' + e + ') AS INTEGER)';
+      if (unit === 'DAYOFWEEK') return '(CAST(strftime(\'%w\',' + e + ') AS INTEGER)+1)';
+      if (unit === 'WEEKDAY') return '((CAST(strftime(\'%w\',' + e + ') AS INTEGER)+6)%7)';
+      var F = { YEAR: '%Y', MONTH: '%m', DAY: '%d', DAYOFMONTH: '%d', HOUR: '%H', MINUTE: '%M', SECOND: '%S' };
+      if (F[unit]) return 'CAST(strftime(\'' + F[unit] + '\',' + e + ') AS INTEGER)';
+      return null;
+    });
+  }
+
+  /**
+   * 日期算术：
+   *   DATE_ADD(x, INTERVAL n unit) / DATE_SUB / ADDDATE / SUBDATE → MYSQL_DATE_ADD/SUB(x, n, 'unit')
+   *   TIMESTAMPADD(unit, n, x) → MYSQL_DATE_ADD(x, n, 'unit')
+   *   TIMESTAMPDIFF(unit, a, b) → MYSQL_TSDIFF('unit', a, b)
+   * 不走 SQLite 的 datetime(x,'+1 month')：那条路对 1 月 31 日 +1 月会给出 3 月 3 日，
+   * 而 MySQL 是收敛到 2 月 28 日，语义不同。
+   */
+  function rewriteDateFunctions(sql) {
+    var s = String(sql);
+    s = rewriteFunctionCalls(s, 'TIMESTAMPDIFF', function (args, raw) {
+      var a = splitTopLevel(raw);
+      if (a.length !== 3) return null;
+      return "MYSQL_TSDIFF('" + a[0].trim().toUpperCase() + "', " + a[1].trim() + ', ' + a[2].trim() + ')';
+    });
+    s = rewriteFunctionCalls(s, 'TIMESTAMPADD', function (args, raw) {
+      var a = splitTopLevel(raw);
+      if (a.length !== 3) return null;
+      return 'MYSQL_DATE_ADD(' + a[2].trim() + ', ' + a[1].trim() + ", '" + a[0].trim().toUpperCase() + "')";
+    });
+    [['DATE_ADD', 'ADD'], ['ADDDATE', 'ADD'], ['DATE_SUB', 'SUB'], ['SUBDATE', 'SUB']].forEach(function (pair) {
+      s = rewriteFunctionCalls(s, pair[0], function (args, raw) {
+        var m = /^([\s\S]+?),\s*INTERVAL\s+([\s\S]+?)\s+([A-Za-z_]+)\s*$/i.exec(raw);
+        if (m) {
+          return 'MYSQL_DATE_' + pair[1] + '(' + m[1].trim() + ', (' + m[2].trim() + "), '" + m[3].toUpperCase() + "')";
+        }
+        var a = splitTopLevel(raw);
+        if (a.length === 2 && !/INTERVAL/i.test(raw)) {
+          return 'MYSQL_DATE_' + pair[1] + '(' + a[0].trim() + ', (' + a[1].trim() + "), 'DAY')";
+        }
+        return null;
+      });
+    });
+    return s;
+  }
+
+  /** INSERT(str,pos,len,newstr) 字符串函数（注意与 INSERT 语句区分：只有紧跟 '(' 才算函数） */
+  function rewriteInsertFunc(sql) {
+    return rewriteFunctionCalls(sql, 'INSERT', function (args, raw) {
+      var a = splitTopLevel(raw);
+      if (a.length !== 4) return null;
+      return 'MYSQL_INSERT(' + a.map(function (x) { return x.trim(); }).join(', ') + ')';
+    });
+  }
+
   function translateStatement(sql, ctx) {
     var s = sql;
     var inDdl = /^\s*CREATE\s+(?:TEMPORARY\s+)?TABLE\b/i.test(s);
     if (inDdl) return translateCreateTable(s);
     if (/FIELD\s*\(/i.test(s)) s = rewriteField(s);
 
+    // ---- MySQL 专有函数语法糖（必须先于通用转译处理） ----
+    if (/\bTRIM\s*\(/i.test(s)) s = rewriteTrim(s);
+    if (/\bISNULL\s*\(/i.test(s)) s = rewriteIsNull(s);
+    if (/\bPOSITION\s*\(/i.test(s)) s = rewritePosition(s);
+    if (/\bCONVERT\s*\(/i.test(s)) s = rewriteConvert(s);
+    if (/\bEXTRACT\s*\(/i.test(s)) s = rewriteExtract(s);
+    if (/\b(?:DATE_ADD|DATE_SUB|ADDDATE|SUBDATE|TIMESTAMPADD|TIMESTAMPDIFF)\s*\(/i.test(s)) s = rewriteDateFunctions(s);
+    // INSERT() 字符串函数：只有不是 DML 的 INSERT 语句时才重写（DML 里 INSERT 后面跟的是 INTO，不会命中）
+    if (!/^\s*INSERT\b/i.test(s) && /\bINSERT\s*\(/i.test(s)) s = rewriteInsertFunc(s);
+
     // TRUNCATE TABLE / TRUNCATE
     s = s.replace(/^\s*TRUNCATE\s+(?:TABLE\s+)?/i, 'DELETE FROM ');
+    // DROP TEMPORARY TABLE t → DROP TABLE t（底层不认识 TEMPORARY 关键字）
+    s = s.replace(/^\s*DROP\s+TEMPORARY\s+TABLE\s+/i, 'DROP TABLE ');
     // INSERT IGNORE → INSERT OR IGNORE
     s = s.replace(/\bINSERT\s+IGNORE\s+INTO\b/i, 'INSERT OR IGNORE INTO');
     // INSERT ... ON DUPLICATE KEY UPDATE ... → INSERT ... ON CONFLICT DO UPDATE SET ...
@@ -476,10 +716,28 @@ var MySQLCore = (function () {
     s = s.replace(/\bAS\s+(CHAR|NCHAR|BINARY)\b/gi, 'AS TEXT');
     // RLIKE 是 REGEXP 的同义词
     s = s.replace(/\bRLIKE\b/gi, 'REGEXP');
-    // GROUP_CONCAT(x SEPARATOR 'y') → GROUP_CONCAT(x, 'y')
-    s = s.replace(/GROUP_CONCAT\s*\(([\s\S]*?)\s+SEPARATOR\s+('[^']*'|"[^"]*")\s*\)/gi, 'GROUP_CONCAT($1, $2)');
+    // GROUP_CONCAT(x [ORDER BY ...] SEPARATOR 'y') → 底层能听懂的等价写法
+    s = rewriteGroupConcat(s, ctx);
     // LIMIT a, b → LIMIT b OFFSET a
     s = s.replace(/\bLIMIT\s+(\d+)\s*,\s*(\d+)\b/gi, 'LIMIT $2 OFFSET $1');
+
+    // ---- 运算符语义对齐 ----
+    // MySQL 的 "/" 永远是小数除法（7/2 得 3.5000），而 SQLite 对两个整数做整除（7/2 得 3）。
+    // 改写为 `a * 1.0 / b`：在左结合的优先级下与 `a / b` 完全等价，但强制走实数除法。
+    // DIV 和 NULL 安全等于 <=> 需要识别两侧操作数，按"原子"（标识符 / 括号表达式 / 数字）匹配。
+    var ATOM = '(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_$.]*|\\([^()]*\\)|[-+]?(?:\\d+\\.?\\d*|\\.\\d+))';
+    // a DIV b → MySQL 是"截断取整的整数除法"（5.5 DIV 2 得 2），CAST 到 INTEGER 正好是朝零截断
+    s = replaceOutsideAll(s, new RegExp('(' + ATOM + ')\\s+DIV\\s+(' + ATOM + ')', 'gi'),
+      function (mm, a, b) { return 'CAST((' + a + ')*1.0/(' + b + ') AS INTEGER)'; });
+    // a <=> b → SQLite 的 IS 就是 NULL 安全等于
+    s = replaceOutsideAll(s, new RegExp('(' + ATOM + ')\\s*<=>\\s*(' + ATOM + ')', 'gi'),
+      function (mm, a, b) { return '((' + a + ') IS (' + b + '))'; });
+    s = mapOutsideQuotesAndComments(s, function (str, i) {
+      if (str.charAt(i) !== '/') return null;
+      if (str.charAt(i - 1) === '*' || str.charAt(i + 1) === '*') return null;
+
+      return { text: '*1.0/', len: 1 };
+    });
 
     // UPDATE / DELETE ... LIMIT n → 用 rowid 子查询限定（SQLite 默认不支持写语句的 LIMIT）
     if (/\sLIMIT\s+\d+\s*$/i.test(s) && /^\s*(?:UPDATE|DELETE)\b/i.test(s)) {
@@ -530,10 +788,10 @@ var MySQLCore = (function () {
     // ALTER TABLE t DROP INDEX|KEY name → DROP INDEX name
     var dropIdx = /^\s*ALTER\s+TABLE\s+`?[A-Za-z0-9_$]+`?\s+DROP\s+(?:INDEX|KEY)\s+(`?[A-Za-z0-9_$]+`?)\s*$/i.exec(s);
     if (dropIdx) return 'DROP INDEX ' + dropIdx[1];
-    // ANALYZE TABLE t → ANALYZE t
-    s = s.replace(/^\s*ANALYZE\s+TABLE\s+/i, 'ANALYZE ');
-    // 无对应能力的表维护语句 → 交由上层当无操作处理
-    if (/^\s*(OPTIMIZE|REPAIR|FLUSH)\s+/i.test(s)) return 'SELECT 1 WHERE 0';
+    // 表维护语句（OPTIMIZE / REPAIR / ANALYZE / CHECK / FLUSH）一律由 runOne 直接接管，
+    // 返回 MySQL 形态的 Table/Op/Msg_type/Msg_text 结果集，因此这里不再转译。
+    // （旧实现把 OPTIMIZE/REPAIR/FLUSH 映射成 `SELECT 1 WHERE 0`，终端上会打印一句
+    //   "Empty set"，形态与真实 MySQL 完全不符。）
 
     // EXPLAIN SELECT ... → EXPLAIN QUERY PLAN SELECT ...（可读性更好）
     if (/^\s*EXPLAIN\s+(?:FORMAT\s*=\s*\w+\s+)?(SELECT|WITH|INSERT|UPDATE|DELETE)\b/i.test(s)) {
@@ -671,6 +929,10 @@ var MySQLCore = (function () {
       return 'ERROR 1048 (23000): Column \'' + parts[parts.length - 1] + '\' cannot be null';
     }
     if (/^FOREIGN KEY constraint failed$/i.test(msg)) {
+      // 底层不区分"子表插入失败"与"父表被引用无法删除"，按语句类型区分（与 MySQL 的 1452/1451 一致）
+      if (/^\s*(?:DELETE|UPDATE)\b/i.test(ctx.stmt || '')) {
+        return 'ERROR 1451 (23000): Cannot delete or update a parent row: a foreign key constraint fails';
+      }
       return 'ERROR 1452 (23000): Cannot add or update a child row: a foreign key constraint fails';
     }
     if (/^CHECK constraint failed:\s*(.+)$/i.test(msg)) {
@@ -757,8 +1019,338 @@ var MySQLCore = (function () {
   }
 
   /** 在 sql.js 的 Database 实例上注册 MySQL 专有函数 */
-  function registerMySQLFunctions(db, dbName) {
-    var def = function (name, fn) { try { db.create_function(name, fn); } catch (e) { /* 忽略重复注册 */ } };
+  /* ======================= 7b. 函数实现用的纯 JS 工具 ======================= */
+
+  /** 解析 'YYYY-MM-DD[ HH:MM[:SS]]'；解析不了返回 null */
+  function parseDateTime(s) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?/.exec(String(s).trim());
+    if (!m) return null;
+    return new Date(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0));
+  }
+
+  /** 按月加，日期溢出时向该月最后一天收敛（MySQL 的 DATE_ADD 语义，SQLite 的 '+1 month' 不是） */
+  function addMonthsClamped(d, months) {
+    var day = d.getDate();
+    var t = new Date(d.getTime());
+    t.setDate(1);
+    t.setMonth(t.getMonth() + months);
+    var lastDay = new Date(t.getFullYear(), t.getMonth() + 1, 0).getDate();
+    t.setDate(Math.min(day, lastDay));
+    d.setTime(t.getTime());
+  }
+
+  function monthsBetween(lo, hi) {
+    var m = (hi.getFullYear() - lo.getFullYear()) * 12 + (hi.getMonth() - lo.getMonth());
+    var probe = new Date(lo.getTime());
+    addMonthsClamped(probe, m);
+    if (probe > hi) m -= 1;
+    return m;
+  }
+
+  function daysBetween(lo, hi) {
+    var a = Date.UTC(lo.getFullYear(), lo.getMonth(), lo.getDate());
+    var b = Date.UTC(hi.getFullYear(), hi.getMonth(), hi.getDate());
+    return Math.round((b - a) / 86400000);
+  }
+
+  /** ISO-8601 周数（周一为一周起点，含 1 月 4 日的那周为第 1 周） */
+  function isoWeek(d) {
+    var t = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    t.setDate(t.getDate() - ((t.getDay() + 6) % 7) + 3);        // 挪到本周周四
+    var first = new Date(t.getFullYear(), 0, 4);
+    first.setDate(first.getDate() - ((first.getDay() + 6) % 7) + 3);
+    return 1 + Math.round((t - first) / (7 * 86400000));
+  }
+
+  function dateAddImpl(dateStr, n, unit, sign) {
+    if (dateStr === null || dateStr === undefined) return null;
+    var d = parseDateTime(dateStr);
+    if (!d) return null;
+    var u = String(unit === null || unit === undefined ? 'DAY' : unit).toUpperCase();
+    if (u.charAt(u.length - 1) === 'S') u = u.slice(0, -1);
+    var amount = Number(n) * sign;
+    if (!isFinite(amount)) return null;
+    var hasTime = /\d{1,2}:\d{2}/.test(String(dateStr));
+    if (u === 'YEAR') d.setFullYear(d.getFullYear() + amount);
+    else if (u === 'QUARTER') addMonthsClamped(d, amount * 3);
+    else if (u === 'MONTH') addMonthsClamped(d, amount);
+    else if (u === 'WEEK') d.setDate(d.getDate() + amount * 7);
+    else if (u === 'DAY') d.setDate(d.getDate() + amount);
+    else if (u === 'HOUR') d.setHours(d.getHours() + amount);
+    else if (u === 'MINUTE') d.setMinutes(d.getMinutes() + amount);
+    else if (u === 'SECOND') d.setSeconds(d.getSeconds() + amount);
+    else if (u === 'MICROSECOND') d.setMilliseconds(d.getMilliseconds() + amount / 1000);
+    else return null;
+    return hasTime ? fmtLocalDT(d) : fmtLocalDate(d);
+  }
+
+  function timestampDiffImpl(unit, a, b) {
+    var da = parseDateTime(a), db = parseDateTime(b);
+    if (!da || !db) return null;
+    var u = String(unit || '').toUpperCase();
+    var sign = db < da ? -1 : 1;
+    var lo = sign > 0 ? da : db, hi = sign > 0 ? db : da;
+    var r;
+    if (u === 'YEAR') r = hi.getFullYear() - lo.getFullYear();
+    else if (u === 'QUARTER') r = Math.floor(monthsBetween(lo, hi) / 3);
+    else if (u === 'MONTH') r = monthsBetween(lo, hi);
+    else if (u === 'WEEK') r = Math.floor(daysBetween(lo, hi) / 7);
+    else if (u === 'DAY') r = daysBetween(lo, hi);
+    else if (u === 'HOUR') r = Math.floor((hi - lo) / 3600000);
+    else if (u === 'MINUTE') r = Math.floor((hi - lo) / 60000);
+    else if (u === 'SECOND') { r = Math.floor((hi - lo) / 1000); }
+    else if (u === 'MICROSECOND') r = (hi - lo) * 1000;
+    else return null;
+    // 完整单位的判定：不足一个单位要退位（例如 1 月 31 日 → 3 月 1 日 只有 1 个整月）
+    if ((u === 'YEAR' || u === 'QUARTER' || u === 'MONTH' || u === 'WEEK' || u === 'DAY') && r > 0) {
+      if (u === 'YEAR' || u === 'QUARTER' || u === 'MONTH') {
+        // monthsBetween 已做过退位判断
+      }
+    }
+    return r * sign;
+  }
+
+  /** 极简 STR_TO_DATE：把 MySQL 格式串翻成正则逐个字段取值 */
+  function strToDateImpl(s, fmt) {
+    var MAP = {
+      '%Y': ['(\\d{4})', 'Y'], '%y': ['(\\d{2})', 'y'], '%m': ['(\\d{1,2})', 'm'], '%c': ['(\\d{1,2})', 'm'],
+      '%d': ['(\\d{1,2})', 'd'], '%e': ['(\\d{1,2})', 'd'],
+      '%H': ['(\\d{1,2})', 'H'], '%k': ['(\\d{1,2})', 'H'], '%h': ['(\\d{1,2})', 'H'], '%I': ['(\\d{1,2})', 'H'],
+      '%i': ['(\\d{1,2})', 'i'], '%s': ['(\\d{1,2})', 's'], '%S': ['(\\d{1,2})', 's'], '%%': ['%', null]
+    };
+    var rx = '^', order = [], i = 0;
+    while (i < fmt.length) {
+      var two = fmt.substr(i, 2);
+      if (MAP[two]) { rx += MAP[two][0]; order.push(MAP[two][1]); i += 2; continue; }
+      rx += fmt.charAt(i).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      i++;
+    }
+    var m = new RegExp(rx + '$').exec(s.trim());
+    if (!m) return null;
+    var v = { Y: 1970, m: 1, d: 1, H: 0, i: 0, s: 0 }, hasTime = false;
+    order.forEach(function (key, idx) {
+      if (!key) return;
+      var n = Number(m[idx + 1]);
+      if (key === 'Y') v.Y = n;
+      else if (key === 'y') v.Y = 2000 + n;
+      else if (key === 'm') v.m = n;
+      else if (key === 'd') v.d = n;
+      else if (key === 'H') { v.H = n; hasTime = true; }
+      else if (key === 'i') { v.i = n; hasTime = true; }
+      else if (key === 's') { v.s = n; hasTime = true; }
+    });
+    return { date: new Date(v.Y, v.m - 1, v.d, v.H, v.i, v.s), hasTime: hasTime };
+  }
+
+  var DAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+  var MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'];
+
+  /* ---- 哈希：浏览器里没有同步的 crypto，这里用标准算法纯 JS 实现 ---- */
+
+  function utf8Bytes(str) {
+    var out = [], s = String(str);
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      if (c < 0x80) out.push(c);
+      else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+      else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+        var c2 = s.charCodeAt(++i);
+        var cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+        out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+      } else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+    }
+    return out;
+  }
+
+  function b2h(n) { return ('0' + (n & 0xff).toString(16)).slice(-2); }
+  function leHex(words) {
+    var out = '';
+    words.forEach(function (w) { for (var i = 0; i < 4; i++) out += b2h(w >>> (8 * i)); });
+    return out;
+  }
+  function beHex(words) {
+    var out = '';
+    words.forEach(function (w) { for (var i = 3; i >= 0; i--) out += b2h(w >>> (8 * i)); });
+    return out;
+  }
+  function padMessage(bytes, bitLen, littleEndian) {
+    var msg = bytes.slice();
+    msg.push(0x80);
+    while (msg.length % 64 !== 56) msg.push(0);
+    var hi = Math.floor(bitLen / 4294967296), lo = bitLen >>> 0;
+    var i;
+    if (littleEndian) {
+      for (i = 0; i < 4; i++) msg.push((lo >>> (8 * i)) & 0xff);
+      for (i = 0; i < 4; i++) msg.push((hi >>> (8 * i)) & 0xff);
+    } else {
+      for (i = 3; i >= 0; i--) msg.push((hi >>> (8 * i)) & 0xff);
+      for (i = 3; i >= 0; i--) msg.push((lo >>> (8 * i)) & 0xff);
+    }
+    return msg;
+  }
+
+  function md5Hex(str) {
+    var bytes = utf8Bytes(str);
+    var msg = padMessage(bytes, bytes.length * 8, true);
+    var S = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+      5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+      4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+      6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21];
+    var K = [];
+    for (var k = 0; k < 64; k++) K[k] = Math.floor(Math.abs(Math.sin(k + 1)) * 4294967296) >>> 0;
+    var add = function () {
+      var s = 0;
+      for (var i = 0; i < arguments.length; i++) s = (s + arguments[i]) >>> 0;
+      return s;
+    };
+    var shl = function (x, c) { return ((x << c) | (x >>> (32 - c))) >>> 0; };
+    var a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+    for (var off = 0; off < msg.length; off += 64) {
+      var M = [];
+      for (var i = 0; i < 16; i++) {
+        M[i] = (msg[off + i * 4] | (msg[off + i * 4 + 1] << 8) | (msg[off + i * 4 + 2] << 16) | (msg[off + i * 4 + 3] << 24)) >>> 0;
+      }
+      var A = a0, B = b0, C = c0, D = d0;
+      for (var r = 0; r < 64; r++) {
+        var F, g;
+        if (r < 16) { F = (B & C) | (~B & D); g = r; }
+        else if (r < 32) { F = (D & B) | (~D & C); g = (5 * r + 1) % 16; }
+        else if (r < 48) { F = B ^ C ^ D; g = (3 * r + 5) % 16; }
+        else { F = C ^ (B | ~D); g = (7 * r) % 16; }
+        F = add(F >>> 0, A, K[r], M[g]);
+        A = D; D = C; C = B;
+        B = add(B, shl(F, S[r]));
+      }
+      a0 = add(a0, A); b0 = add(b0, B); c0 = add(c0, C); d0 = add(d0, D);
+    }
+    return leHex([a0, b0, c0, d0]);
+  }
+
+  function sha1Hex(str) {
+    var bytes = utf8Bytes(str);
+    var msg = padMessage(bytes, bytes.length * 8, false);
+    var h = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+    var w = new Array(80);
+    var rol = function (x, n) { return ((x << n) | (x >>> (32 - n))) >>> 0; };
+    for (var off = 0; off < msg.length; off += 64) {
+      for (var i = 0; i < 16; i++) {
+        w[i] = ((msg[off + i * 4] << 24) | (msg[off + i * 4 + 1] << 16) | (msg[off + i * 4 + 2] << 8) | msg[off + i * 4 + 3]) >>> 0;
+      }
+      for (var t = 16; t < 80; t++) w[t] = rol(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1);
+      var a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+      for (var r = 0; r < 80; r++) {
+        var f, k;
+        if (r < 20) { f = (b & c) | (~b & d); k = 0x5a827999; }
+        else if (r < 40) { f = b ^ c ^ d; k = 0x6ed9eba1; }
+        else if (r < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }
+        else { f = b ^ c ^ d; k = 0xca62c1d6; }
+        var tmp = (rol(a, 5) + (f >>> 0) + (e >>> 0) + k + w[r]) >>> 0;
+        e = d; d = c; c = rol(b, 30); b = a; a = tmp;
+      }
+      h[0] = (h[0] + a) >>> 0; h[1] = (h[1] + b) >>> 0; h[2] = (h[2] + c) >>> 0;
+      h[3] = (h[3] + d) >>> 0; h[4] = (h[4] + e) >>> 0;
+    }
+    return beHex(h);
+  }
+
+  var SHA256_K = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  ];
+
+  function sha256Hex(str, truncateBits) {
+    var bytes = utf8Bytes(str);
+    var msg = padMessage(bytes, bytes.length * 8, false);
+    var h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    var w = new Array(64);
+    var rr = function (x, n) { return ((x >>> n) | (x << (32 - n))) >>> 0; };
+    for (var off = 0; off < msg.length; off += 64) {
+      for (var i = 0; i < 16; i++) {
+        w[i] = ((msg[off + i * 4] << 24) | (msg[off + i * 4 + 1] << 16) | (msg[off + i * 4 + 2] << 8) | msg[off + i * 4 + 3]) >>> 0;
+      }
+      for (var t = 16; t < 64; t++) {
+        var s0 = (rr(w[t - 15], 7) ^ rr(w[t - 15], 18) ^ (w[t - 15] >>> 3)) >>> 0;
+        var s1 = (rr(w[t - 2], 17) ^ rr(w[t - 2], 19) ^ (w[t - 2] >>> 10)) >>> 0;
+        w[t] = (w[t - 16] + s0 + w[t - 7] + s1) >>> 0;
+      }
+      var a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+      for (var r = 0; r < 64; r++) {
+        var S1 = (rr(e, 6) ^ rr(e, 11) ^ rr(e, 25)) >>> 0;
+        var ch = ((e & f) ^ (~e & g)) >>> 0;
+        var t1 = (hh + S1 + ch + SHA256_K[r] + w[r]) >>> 0;
+        var S0 = (rr(a, 2) ^ rr(a, 13) ^ rr(a, 22)) >>> 0;
+        var mj = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
+        var t2 = (S0 + mj) >>> 0;
+        hh = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+      }
+      h[0] = (h[0] + a) >>> 0; h[1] = (h[1] + b) >>> 0; h[2] = (h[2] + c) >>> 0; h[3] = (h[3] + d) >>> 0;
+      h[4] = (h[4] + e) >>> 0; h[5] = (h[5] + f) >>> 0; h[6] = (h[6] + g) >>> 0; h[7] = (h[7] + hh) >>> 0;
+    }
+    var full = beHex(h);
+    if (truncateBits === 224) return full.slice(0, 56);
+    if (truncateBits === 384) {
+      // SHA-384 用另一组初值，这里不实现；调用方会退回 SHA-256
+      return null;
+    }
+    return full;
+  }
+
+  function registerMySQLFunctions(db, dbName, state) {
+    var fnErrors = [];
+    // 会话级信息，供 LAST_INSERT_ID() / ROW_COUNT() / FOUND_ROWS() 读取（由 runOne 维护）
+    var infoState = state || { lastInsertId: 0, rowCount: 0, foundRows: 0 };
+    var def = function (name, fn) {
+      try { db.create_function(name, fn); }
+      catch (e) { fnErrors.push(name + ': ' + (e && e.message ? e.message : e)); }
+    };
+
+    /**
+     * 变参函数注册器。
+     *
+     * sql.js 的 Database.create_function 用 **JS 函数的形参个数** 当注册的 nArg
+     * （见 vendor/sql-wasm.js：`tb(this.db, g, l.length, 1, 0, n, 0, 0, 0)`）。
+     * 于是 `function () {...}` 这种变参惯用写法会被注册成 0 元函数，后果分两种：
+     *   · SQLite 里有同名内建（concat / concat_ws）→ 静默回落到内建语义，
+     *     例如 CONCAT('a', NULL) 返回 'a'，而 MySQL 应该返回 NULL；
+     *   · SQLite 里没有同名内建（GREATEST / LEAST）→ 一调用就报
+     *     "wrong number of arguments to function GREATEST()"。
+     * 修法：按 1..N 逐个元数各注册一次（SQLite 优先匹配精确元数的实现）。
+     */
+    var ARITY_FACTORY = [
+      null,
+      function (f) { return function (a) { return f.apply(null, arguments); }; },
+      function (f) { return function (a, b) { return f.apply(null, arguments); }; },
+      function (f) { return function (a, b, c) { return f.apply(null, arguments); }; },
+      function (f) { return function (a, b, c, d) { return f.apply(null, arguments); }; },
+      function (f) { return function (a, b, c, d, e) { return f.apply(null, arguments); }; },
+      function (f) { return function (a, b, c, d, e, g) { return f.apply(null, arguments); }; },
+      function (f) { return function (a, b, c, d, e, g, h) { return f.apply(null, arguments); }; },
+      function (f) { return function (a, b, c, d, e, g, h, i) { return f.apply(null, arguments); }; },
+      function (f) { return function (a, b, c, d, e, g, h, i, j) { return f.apply(null, arguments); }; },
+      function (f) { return function (a, b, c, d, e, g, h, i, j, k) { return f.apply(null, arguments); }; },
+      function (f) { return function (a, b, c, d, e, g, h, i, j, k, l) { return f.apply(null, arguments); }; },
+      function (f) { return function (a, b, c, d, e, g, h, i, j, k, l, m) { return f.apply(null, arguments); }; },
+      function (f) { return function (a, b, c, d, e, g, h, i, j, k, l, m, n) { return f.apply(null, arguments); }; },
+      function (f) { return function (a, b, c, d, e, g, h, i, j, k, l, m, n, o) { return f.apply(null, arguments); }; },
+      function (f) { return function (a, b, c, d, e, g, h, i, j, k, l, m, n, o, p) { return f.apply(null, arguments); }; },
+      function (f) { return function (a, b, c, d, e, g, h, i, j, k, l, m, n, o, p, q) { return f.apply(null, arguments); }; }
+    ];
+    var defVariadic = function (name, fn, maxArgs) {
+      var top = Math.min(maxArgs || (ARITY_FACTORY.length - 1), ARITY_FACTORY.length - 1);
+      for (var n = 1; n <= top; n++) def(name, ARITY_FACTORY[n](fn));
+    };
+    /** 只接受 0 参、但 MySQL 允许写精度的函数（NOW(6) / CURDATE() 等） */
+    var def0or1 = function (name, fn) {
+      def(name, function () { return fn(); });
+      def(name, function (prec) { return fn(); });
+    };
 
     def('VERSION', function () { return SERVER_VERSION_FULL; });
     def('DATABASE', function () { return dbName; });
@@ -767,19 +1359,20 @@ var MySQLCore = (function () {
     def('CURRENT_USER', function () { return CURRENT_USER; });
     def('SESSION_USER', function () { return CURRENT_USER; });
     def('SYSTEM_USER', function () { return CURRENT_USER; });
-    def('NOW', function () { return fmtLocalDT(new Date()); });
-    def('LOCALTIME', function () { return fmtLocalDT(new Date()); });
-    def('LOCALTIMESTAMP', function () { return fmtLocalDT(new Date()); });
-    def('SYSDATE', function () { return fmtLocalDT(new Date()); });
-    def('CURDATE', function () { return fmtLocalDate(new Date()); });
-    def('CURTIME', function () { return fmtLocalTime(new Date()); });
+    def0or1('NOW', function () { return fmtLocalDT(new Date()); });
+    def0or1('LOCALTIME', function () { return fmtLocalDT(new Date()); });
+    def0or1('LOCALTIMESTAMP', function () { return fmtLocalDT(new Date()); });
+    def0or1('SYSDATE', function () { return fmtLocalDT(new Date()); });
+    def0or1('CURDATE', function () { return fmtLocalDate(new Date()); });
+    def0or1('CURTIME', function () { return fmtLocalTime(new Date()); });
     def('CONNECTION_ID', function () { return CONNECTION_ID; });
-    def('CONCAT', function () {
+    defVariadic('CONCAT', function () {
       var a = Array.prototype.slice.call(arguments);
+      // MySQL：只要有一个参数是 NULL，整个结果就是 NULL
       if (a.some(function (x) { return x === null || x === undefined; })) return null;
       return a.join('');
     });
-    def('CONCAT_WS', function () {
+    defVariadic('CONCAT_WS', function () {
       var a = Array.prototype.slice.call(arguments);
       var sep = a.shift();
       if (sep === null || sep === undefined) return null;
@@ -792,7 +1385,9 @@ var MySQLCore = (function () {
       try { return new RegExp(String(pat), 'i').test(String(s)) ? 1 : 0; } catch (e) { return 0; }
     });
     // MySQL FIELD(): 返回第一个参数在后续参数列表中首次出现的位置（从 1 开始），没有则 0
-    def('FIELD', function () {
+    // FIELD 主要靠 translateStatement 展开成 CASE；这里再按元数注册一份，
+    // 保证在没被改写到的位置（例如嵌套在别的函数里）也能用。
+    defVariadic('FIELD', function () {
       var a = Array.prototype.slice.call(arguments);
       var target = a.shift();
       if (target === null || target === undefined) return 0;
@@ -805,19 +1400,30 @@ var MySQLCore = (function () {
     def('NULLIF', function (a, b) { return a === b ? null : a; });
     def('LEFT', function (s, n) { return s === null || s === undefined ? null : String(s).slice(0, Math.max(0, n | 0)); });
     def('RIGHT', function (s, n) { return s === null || s === undefined ? null : String(s).slice(-Math.max(0, n | 0)); });
-    def('MID', function (s, p, n) { return s === null || s === undefined ? null : String(s).substr(p - 1, n); });
-    def('SUBSTRING', function (s, p, n) {
+    // SUBSTRING / SUBSTR / MID：MySQL 允许 2 参写法（SUBSTRING(s,p)），
+    // 旧实现声明成 (s,p,n) → 只注册了 3 元，2 参调用会掉到 SQLite 内建上去。
+    var subImpl = function (s, p, n) {
       if (s === null || s === undefined) return null;
       var str = String(s);
-      p = p | 0;
-      if (n === undefined) return p > 0 ? str.slice(p - 1) : str.slice(p);
+      p = p === null || p === undefined ? 1 : (p | 0);
+      if (n === undefined || n === null) return p > 0 ? str.slice(p - 1) : str.slice(p);
       return p > 0 ? str.substr(p - 1, n) : str.substr(p, n);
-    });
-    def('LOCATE', function (sub, str, pos) {
+    };
+    def('MID', function (s, p) { return subImpl(s, p); });
+    def('MID', function (s, p, n) { return subImpl(s, p, n); });
+    def('SUBSTRING', function (s, p) { return subImpl(s, p); });
+    def('SUBSTRING', function (s, p, n) { return subImpl(s, p, n); });
+    def('SUBSTR', function (s, p) { return subImpl(s, p); });
+    def('SUBSTR', function (s, p, n) { return subImpl(s, p, n); });
+
+    // LOCATE：两参版 LOCATE(sub, str) 在 MySQL 里合法（旧实现只注册了 3 元）
+    var locImpl = function (sub, str, pos) {
       if (sub === null || str === null || sub === undefined || str === undefined) return null;
-      var p = str.indexOf(sub, pos ? pos - 1 : 0);
+      var p = String(str).indexOf(String(sub), pos ? pos - 1 : 0);
       return p < 0 ? 0 : p + 1;
-    });
+    };
+    def('LOCATE', function (sub, str) { return locImpl(sub, str); });
+    def('LOCATE', function (sub, str, pos) { return locImpl(sub, str, pos); });
     def('UCASE', function (s) { return s === null || s === undefined ? null : String(s).toUpperCase(); });
     def('LCASE', function (s) { return s === null || s === undefined ? null : String(s).toLowerCase(); });
     def('CHAR_LENGTH', function (s) { return s === null || s === undefined ? null : Array.from(String(s)).length; });
@@ -839,14 +1445,26 @@ var MySQLCore = (function () {
       return s;
     });
     def('RAND', function () { return Math.random(); });
-    def('GREATEST', function () {
-      var a = Array.prototype.slice.call(arguments).filter(function (x) { return x !== null && x !== undefined; });
-      return a.length ? Math.max.apply(null, a.map(Number)) : null;
-    });
-    def('LEAST', function () {
-      var a = Array.prototype.slice.call(arguments).filter(function (x) { return x !== null && x !== undefined; });
-      return a.length ? Math.min.apply(null, a.map(Number)) : null;
-    });
+    var extremes = function (which) {
+      return function () {
+        var a = Array.prototype.slice.call(arguments);
+        // MySQL：任一参数为 NULL 就返回 NULL（旧实现是把 NULL 过滤掉，语义不对）
+        for (var i = 0; i < a.length; i++) if (a[i] === null || a[i] === undefined) return null;
+        if (!a.length) return null;
+        var allNum = a.every(function (x) { return String(x).trim() !== '' && isFinite(Number(x)); });
+        if (allNum) {
+          var nums = a.map(Number);
+          return which === 'max' ? Math.max.apply(null, nums) : Math.min.apply(null, nums);
+        }
+        var strs = a.map(String).sort(function (x, y) {
+          var lx = x.toLowerCase(), ly = y.toLowerCase();
+          return lx < ly ? -1 : (lx > ly ? 1 : 0);
+        });
+        return which === 'max' ? strs[strs.length - 1] : strs[0];
+      };
+    };
+    defVariadic('GREATEST', extremes('max'));
+    defVariadic('LEAST', extremes('min'));
     def('UUID', function () {
       return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
         var r = Math.random() * 16 | 0, v = c === 'x' ? r : ((r & 0x3) | 0x8);
@@ -883,6 +1501,245 @@ var MySQLCore = (function () {
       var last = new Date(dt.getFullYear(), dt.getMonth() + 1, 0);
       return fmtLocalDate(last);
     });
+
+    // MySQL 的 FORMAT(x, d)：四舍五入到 d 位并加千分位（旧实现其实落到了 SQLite 的 printf 上，
+    // 原样返回，等于"假装成功"）
+    def('FORMAT', function (x, d) {
+      if (x === null || x === undefined) return null;
+      var n = Number(x);
+      if (!isFinite(n)) return '0';
+      var dec = (d === null || d === undefined) ? 0 : Math.max(0, Math.min(30, d | 0));
+      var neg = n < 0;
+      var parts = Math.abs(n).toFixed(dec).split('.');
+      parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+      return (neg ? '-' : '') + parts.join('.');
+    });
+
+    /* ---- 日期时间 ---- */
+    def('DATEDIFF', function (a, b) {
+      var da = parseDateTime(a), db = parseDateTime(b);
+      if (!da || !db) return null;
+      return daysBetween(db, da);
+    });
+    def('MYSQL_DATE_ADD', function (d, n, unit) { return dateAddImpl(d, n, unit, 1); });
+    def('MYSQL_DATE_SUB', function (d, n, unit) { return dateAddImpl(d, n, unit, -1); });
+    def('MYSQL_TSDIFF', function (unit, a, b) { return timestampDiffImpl(unit, a, b); });
+    def('DAYNAME', function (d) {
+      var x = parseDateTime(d);
+      return x ? DAY_NAMES[(x.getDay() + 6) % 7] : null;
+    });
+    def('MONTHNAME', function (d) {
+      var x = parseDateTime(d);
+      return x ? MONTH_NAMES[x.getMonth()] : null;
+    });
+    def('QUARTER', function (d) {
+      var x = parseDateTime(d);
+      return x ? Math.floor(x.getMonth() / 3) + 1 : null;
+    });
+    def('DAYOFYEAR', function (d) {
+      var x = parseDateTime(d);
+      if (!x) return null;
+      return Math.floor((Date.UTC(x.getFullYear(), x.getMonth(), x.getDate()) - Date.UTC(x.getFullYear(), 0, 1)) / 86400000) + 1;
+    });
+    def('DAYOFWEEK', function (d) { var x = parseDateTime(d); return x ? x.getDay() + 1 : null; });   // 1=周日
+    def('WEEKDAY', function (d) { var x = parseDateTime(d); return x ? (x.getDay() + 6) % 7 : null; }); // 0=周一
+    def('DAYOFMONTH', function (d) { var x = parseDateTime(d); return x ? x.getDate() : null; });
+    // WEEK(date[,mode])：实现 MySQL 默认的 mode=0（周日为一周起点，第一周从首个周日算起）。
+    // 注意要注册 1 元和 2 元两种（sql.js 用 fn.length 当 nArg）。
+    var weekImpl = function (d, mode) {
+      var x = parseDateTime(d);
+      if (!x) return null;
+      if (mode === 3) return isoWeek(x);
+      var doy = Math.floor((Date.UTC(x.getFullYear(), x.getMonth(), x.getDate()) - Date.UTC(x.getFullYear(), 0, 1)) / 86400000) + 1;
+      return Math.floor((doy + 6 - (x.getDay() + 1)) / 7);
+    };
+    def('WEEK', function (d) { return weekImpl(d); });
+    def('WEEK', function (d, mode) { return weekImpl(d, mode); });
+    def('WEEKOFYEAR', function (d) { var x = parseDateTime(d); return x ? isoWeek(x) : null; });
+    def('STR_TO_DATE', function (s, fmt) {
+      if (s === null || s === undefined || fmt === null || fmt === undefined) return null;
+      var r = strToDateImpl(String(s), String(fmt));
+      if (!r) return null;
+      return r.hasTime ? fmtLocalDT(r.date) : fmtLocalDate(r.date);
+    });
+    def('TIME_TO_SEC', function (t) {
+      if (t === null || t === undefined) return null;
+      var m = /(\d{1,3}):(\d{2}):?(\d{2})?/.exec(String(t));
+      return m ? (+m[1]) * 3600 + (+m[2]) * 60 + (+(m[3] || 0)) : null;
+    });
+    def('SEC_TO_TIME', function (s) {
+      if (s === null || s === undefined) return null;
+      var n = Math.floor(Number(s)), neg = n < 0;
+      n = Math.abs(n);
+      var p = function (x) { return (x < 10 ? '0' : '') + x; };
+      return (neg ? '-' : '') + p(Math.floor(n / 3600)) + ':' + p(Math.floor(n / 60) % 60) + ':' + p(n % 60);
+    });
+
+    /* ---- 字符串 ---- */
+    def('SUBSTRING_INDEX', function (str, delim, count) {
+      if (str === null || str === undefined || delim === null || delim === undefined) return null;
+      var s = String(str), d = String(delim), n = Number(count);
+      if (!isFinite(n) || n === 0 || d === '') return '';
+      var parts = s.split(d);
+      return n > 0 ? parts.slice(0, n).join(d) : parts.slice(n).join(d);
+    });
+    defVariadic('ELT', function () {
+      var a = Array.prototype.slice.call(arguments);
+      var n = Number(a.shift());
+      if (!isFinite(n) || n < 1 || n > a.length) return null;
+      return a[n - 1];
+    });
+    def('FIND_IN_SET', function (x, list) {
+      if (x === null || x === undefined || list === null || list === undefined) return null;
+      var parts = String(list).split(',');
+      for (var i = 0; i < parts.length; i++) if (parts[i] === String(x)) return i + 1;
+      return 0;
+    });
+    def('ASCII', function (s) {
+      if (s === null || s === undefined) return null;
+      var b = utf8Bytes(String(s));
+      return b.length ? b[0] : 0;
+    });
+    defVariadic('CHAR', function () {
+      var a = Array.prototype.slice.call(arguments);
+      return a.map(function (n) { return String.fromCharCode(Number(n) & 0xff); }).join('');
+    });
+    def('HEX', function (v) {
+      if (v === null || v === undefined) return null;
+      if (typeof v === 'number' || /^-?\d+$/.test(String(v))) {
+        var n = Math.trunc(Number(v));
+        return (n < 0 ? 'FFFFFFFFFFFFFFFF' : '') + (n >>> 0).toString(16).toUpperCase();
+      }
+      var b = utf8Bytes(String(v));
+      return b.map(function (x) { return b2h(x); }).join('').toUpperCase();
+    });
+    def('UNHEX', function (s) {
+      if (s === null || s === undefined) return null;
+      var h = String(s);
+      if (h.length % 2 || /[^0-9a-f]/i.test(h)) return null;
+      var out = '';
+      for (var i = 0; i < h.length; i += 2) out += String.fromCharCode(parseInt(h.substr(i, 2), 16));
+      return out;
+    });
+    def('MD5', function (s) { return s === null || s === undefined ? null : md5Hex(String(s)); });
+    def('SHA1', function (s) { return s === null || s === undefined ? null : sha1Hex(String(s)); });
+    def('SHA', function (s) { return s === null || s === undefined ? null : sha1Hex(String(s)); });
+    def('SHA2', function (s, bits) {
+      if (s === null || s === undefined) return null;
+      var b = Number(bits) || 256;
+      if (b === 224) return sha256Hex(String(s), 224);
+      if (b === 256 || b === 0) return sha256Hex(String(s));
+      return null;   // 384 / 512 未实现，返回 NULL 而不是编一个假摘要
+    });
+    def('CONV', function (n, from, to) {
+      if (n === null || n === undefined) return null;
+      var f = Number(from) || 10, t = Number(to) || 10;
+      var v = parseInt(String(n).replace(/^[-+]/, ''), f);
+      if (!isFinite(v)) return '0';
+      var neg = /^-/.test(String(n).trim());
+      return (neg ? '-' : '') + v.toString(t).toUpperCase();
+    });
+    def('MYSQL_INSERT', function (str, pos, len, newstr) {
+      if (str === null || str === undefined) return null;
+      var s = String(str), p = Number(pos) | 0, l = Number(len) | 0;
+      if (p < 1 || p > s.length) return s;
+      if (l < 0 || p + l - 1 > s.length) l = s.length - p + 1;
+      var rep = newstr === null || newstr === undefined ? '' : String(newstr);
+      return s.slice(0, p - 1) + rep + s.slice(p - 1 + l);
+    });
+    def('SPACE', function (n) {
+      if (n === null || n === undefined) return null;
+      var c = Number(n);
+      return c > 0 ? new Array(Math.floor(c) + 1).join(' ') : '';
+    });
+    def('BIN', function (n) { return n === null || n === undefined ? null : (Math.trunc(Number(n)) >>> 0).toString(2); });
+    def('OCT', function (n) { return n === null || n === undefined ? null : (Math.trunc(Number(n)) >>> 0).toString(8); });
+
+    /* ---- 数值 ---- */
+    def('MOD', function (a, b) {
+      if (a === null || a === undefined || b === null || b === undefined) return null;
+      var x = Number(a), y = Number(b);
+      if (!isFinite(x) || !isFinite(y) || y === 0) return null;
+      return x % y;
+    });
+    def('POW', function (a, b) { return a === null || b === null ? null : Math.pow(Number(a), Number(b)); });
+    def('POWER', function (a, b) { return a === null || b === null ? null : Math.pow(Number(a), Number(b)); });
+    def('TRUNCATE', function (x, d) {
+      if (x === null || x === undefined) return null;
+      var n = Number(x), dec = Number(d) | 0;
+      var m = Math.pow(10, dec);
+      return Math.trunc(n * m) / m;
+    });
+    def('SIGN', function (x) { return x === null || x === undefined ? null : (Number(x) > 0 ? 1 : (Number(x) < 0 ? -1 : 0)); });
+    def('ISNULL', function (x) { return (x === null || x === undefined) ? 1 : 0; });
+
+    /* ---- 会话信息 ---- */
+    def('LAST_INSERT_ID', function () { return infoState.lastInsertId || 0; });
+    def('ROW_COUNT', function () { return infoState.rowCount || 0; });
+    def('FOUND_ROWS', function () { return infoState.foundRows || 0; });
+    def('UUID_SHORT', function () {
+      return Math.floor(Date.now() / 1000) * 1000 + Math.floor(Math.random() * 1000);
+    });
+    def('INET_ATON', function (ip) {
+      if (ip === null || ip === undefined) return null;
+      var p = String(ip).split('.');
+      if (p.length !== 4) return null;
+      return ((+p[0] << 24) | (+p[1] << 16) | (+p[2] << 8) | (+p[3])) >>> 0;
+    });
+    def('INET_NTOA', function (n) {
+      if (n === null || n === undefined) return null;
+      var v = Number(n) >>> 0;
+      return [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255].join('.');
+    });
+    // BENCHMARK 在 MySQL 里恒返回 0；SLEEP 在真实 MySQL 里会阻塞，浏览器里不能阻塞 UI，
+    // 所以两者都"接受语法、返回 MySQL 的返回值"，但不做真实计时（也不假装做了）。
+    def('BENCHMARK', function () { return 0; });
+    def('SLEEP', function () { return 0; });
+    def('GET_LOCK', function () { return 1; });          // 单连接：锁总是能拿到
+    def('RELEASE_LOCK', function () { return 1; });
+    def('IS_FREE_LOCK', function () { return 1; });
+    def('IS_USED_LOCK', function () { return null; });
+
+    /* ---- 统计聚合（Welford 在线算法） ---- */
+    var varianceAgg = function (sample) {
+      return {
+        init: function () { return { n: 0, mean: 0, m2: 0 }; },
+        step: function (st, v) {
+          if (v === null || v === undefined) return st;
+          var x = Number(v);
+          if (!isFinite(x)) return st;
+          st.n++;
+          var d = x - st.mean;
+          st.mean += d / st.n;
+          st.m2 += d * (x - st.mean);
+          return st;
+        },
+        finalize: function (st) {
+          if (!st || st.n === 0) return null;
+          if (st.n === 1) return sample ? 0 : 0;
+          return sample ? st.m2 / (st.n - 1) : st.m2 / st.n;
+        }
+      };
+    };
+    var defAgg = function (name, spec) {
+      try { db.create_aggregate(name, spec); }
+      catch (e) { fnErrors.push(name + ': ' + (e && e.message ? e.message : e)); }
+    };
+    var sqrtAgg = function (spec) {
+      var fin = spec.finalize;
+      return {
+        init: spec.init, step: spec.step,
+        finalize: function (st) { var v = fin(st); return v === null ? null : Math.sqrt(v); }
+      };
+    };
+    defAgg('VARIANCE', varianceAgg(true));
+    defAgg('VAR_SAMP', varianceAgg(true));
+    defAgg('VAR_POP', varianceAgg(false));
+    defAgg('STDDEV', sqrtAgg(varianceAgg(true)));
+    defAgg('STDDEV_SAMP', sqrtAgg(varianceAgg(true)));
+    defAgg('STDDEV_POP', sqrtAgg(varianceAgg(false)));
+
+    try { db.__mysqlFnErrors = fnErrors; } catch (e) { /* 仅供测试观察注册失败 */ }
   }
 
   /** 极简 strftime 实现（不依赖 SQLite 的 strftime，避免依赖注册时机） */
@@ -912,13 +1769,153 @@ var MySQLCore = (function () {
 
   function rs(columns, values) { return { columns: columns, values: values }; }
 
-  function describeResult(meta, tableName) {
-    return rs(
-      ['Field', 'Type', 'Null', 'Key', 'Default', 'Extra'],
-      meta.columns.map(function (c) {
-        return [c.field, c.type, c.nullable ? 'YES' : 'NO', c.key || '', c.hasDefault ? (c.defaultValue === null ? 'NULL' : c.defaultValue) : 'NULL', c.extra || ''];
-      })
-    );
+  /* ---- 8.2a SHOW 系列共用的小工具 ---- */
+
+  /** 把 `db`.`tbl` / db.tbl / `tbl` / tbl 拆成 { db, table }（db 为 null 表示未限定库） */
+  function splitDbTable(token) {
+    var t = stripQuotes(String(token === undefined || token === null ? '' : token).trim());
+    var dot = t.indexOf('.');
+    if (dot < 0) return { db: null, table: t };
+    return { db: stripQuotes(t.slice(0, dot).trim()), table: stripQuotes(t.slice(dot + 1).trim()) };
+  }
+
+  /** MySQL 的 LIKE 模式 → 正则：% 匹配任意长，_ 匹配单个字符，其余按字面量 */
+  function likeRegex(pattern) {
+    return new RegExp('^' + String(pattern)
+      .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      .replace(/%/g, '.*')
+      .replace(/_/g, '.') + '$', 'i');
+  }
+
+  /** SHOW ... WHERE 里的字面量；无法解析时返回 undefined */
+  function showOperand(text) {
+    var t = String(text).trim();
+    if (/^NULL$/i.test(t)) return null;
+    if (/^'(?:[^']|'')*'$/.test(t)) return t.slice(1, -1).split("''").join("'");
+    if (/^"(?:[^"]|"")*"$/.test(t)) return t.slice(1, -1).split('""').join('"');
+    if (/^[-+]?\d+(?:\.\d+)?$/.test(t)) return Number(t);
+    return undefined;
+  }
+
+  /** SHOW ... WHERE 的单个比较：能当数字比就按数字比，否则按不区分大小写的字符串比 */
+  function showCompare(a, b, op) {
+    var na = Number(a), nb = Number(b);
+    var numeric = a !== null && a !== undefined && b !== null && b !== undefined &&
+      String(a).trim() !== '' && String(b).trim() !== '' && isFinite(na) && isFinite(nb);
+    var x = numeric ? na : (a === null || a === undefined ? null : String(a).toLowerCase());
+    var y = numeric ? nb : (b === null || b === undefined ? null : String(b).toLowerCase());
+    if (op === '=') return x === y;
+    if (op === '!=' || op === '<>') return x !== y;
+    if (x === null || y === null) return false;
+    if (op === '<') return x < y;
+    if (op === '<=') return x <= y;
+    if (op === '>') return x > y;
+    if (op === '>=') return x >= y;
+    return true;
+  }
+
+  /**
+   * 对 SHOW 系列的结果行做 LIKE / WHERE 过滤。
+   * 返回 { rows, unsupported }：unsupported 为 true 表示 WHERE 太复杂、没能过滤，
+   * 调用方要如实提示，而不是假装过滤过了。
+   */
+  function filterShowRows(rows, tail, colNames) {
+    var t = String(tail || '');
+    var mL = /\bLIKE\s+'((?:[^']|'')*)'/i.exec(t);
+    if (mL) {
+      var rx = likeRegex(mL[1].split("''").join("'"));
+      return { rows: rows.filter(function (r) { return rx.test(String(r[0])); }), unsupported: false };
+    }
+    var mW = /\bWHERE\s+([\s\S]+)$/i.exec(t);
+    if (!mW) return { rows: rows, unsupported: false };
+
+    var out = rows, ok = true;
+    String(mW[1]).split(/\s+AND\s+/i).forEach(function (cond) {
+      if (!ok) return;
+      var m = /^\s*`?([A-Za-z0-9_$]+)`?\s*(<=|>=|<>|!=|=|<|>)\s*(.+?)\s*$/.exec(cond);
+      if (!m) { ok = false; return; }
+      var idx = -1;
+      for (var i = 0; i < colNames.length; i++) {
+        if (String(colNames[i]).toLowerCase() === m[1].toLowerCase()) idx = i;
+      }
+      if (idx < 0) { ok = false; return; }
+      var want = showOperand(m[3]);
+      if (want === undefined) { ok = false; return; }
+      var op = m[2];
+      out = out.filter(function (r) { return showCompare(r[idx], want, op); });
+    });
+    return { rows: out, unsupported: !ok };
+  }
+
+  /** SHOW ... WHERE 条件超出解析能力时的统一提示（如实说明，而不是假装过滤过了） */
+  var SHOW_FILTER_NOTE = '（提示：该 WHERE 条件超出模拟器的解析范围，因此**没有**做过滤。'
+    + '支持 LIKE \'模式\'，以及按列名的简单比较（=、!=、<>、<、<=、>、>=，可用 AND 连接）。）';
+
+  /** 判断一段建表原文是不是 MySQL 风格（seed 数据里存的 raw 是 MySQL 原文，直接回显最保真） */
+  function isMySQLFlavoredDDL(raw) {
+    var s = String(raw || '');
+    if (!/^\s*CREATE\s+(?:TEMPORARY\s+)?TABLE\b/i.test(s)) return false;
+    return /\bENGINE\s*=|DEFAULT\s+CHARSET|AUTO_INCREMENT|\bCOMMENT\s+'/.test(s);
+  }
+
+  /**
+   * SHOW CREATE TABLE 的输出。
+   * seed 数据里存的 raw 本来就是 MySQL 原文（带 ENGINE/CHARSET/COMMENT），直接回显；
+   * 用户自己建的表 raw 是 SQLite 措辞（没有 ENGINE、类型名也不对），这类由 catalog 重新生成。
+   */
+  function showCreateTable(meta, name) {
+    if (meta && meta.raw && isMySQLFlavoredDDL(meta.raw)) return meta.raw;
+    if (!meta) return 'CREATE TABLE `' + name + '` ()';
+    var q = function (c) { return '`' + c + '`'; };
+    var lines = (meta.columns || []).map(function (c) {
+      var def = q(c.field) + ' ' + (c.type || 'text');
+      def += c.nullable ? ' DEFAULT NULL' : ' NOT NULL';
+      if (c.hasDefault && c.defaultValue !== null && c.defaultValue !== undefined &&
+          !/^CURRENT_TIMESTAMP$/i.test(String(c.defaultValue))) {
+        var dv = String(c.defaultValue);
+        def += ' DEFAULT ' + (/^-?\d+(?:\.\d+)?$/.test(dv) ? dv : "'" + dv.replace(/'/g, "''") + "'");
+      } else if (c.hasDefault && /^CURRENT_TIMESTAMP$/i.test(String(c.defaultValue))) {
+        def += ' DEFAULT CURRENT_TIMESTAMP';
+      }
+      if (c.extra && /auto_increment/i.test(c.extra)) def += ' AUTO_INCREMENT';
+      if (c.comment) def += " COMMENT '" + String(c.comment).replace(/'/g, "''") + "'";
+      return def;
+    });
+    var indexes = meta.indexes || [];
+    var hasPk = indexes.some(function (ix) { return ix.primary; });
+    indexes.forEach(function (ix) {
+      var cols = (ix.columns || []).map(q).join(',');
+      if (ix.primary) lines.push('PRIMARY KEY (' + cols + ')');
+      else if (ix.unique) lines.push('UNIQUE KEY ' + q(ix.name) + ' (' + cols + ')');
+      else lines.push('KEY ' + q(ix.name) + ' (' + cols + ')');
+    });
+    // 列上内联写的主键（如 `id int PRIMARY KEY`）不会进 indexes，这里补回来
+    if (!hasPk) {
+      var pkCols = (meta.columns || []).filter(function (c) { return c.key === 'PRI'; }).map(function (c) { return q(c.field); });
+      if (pkCols.length) lines.push('PRIMARY KEY (' + pkCols.join(',') + ')');
+    }
+    (meta.foreignKeys || []).forEach(function (fk) {
+      lines.push('CONSTRAINT `fk_' + name + '_' + (fk.columns || []).join('_') + '` FOREIGN KEY (' +
+        (fk.columns || []).map(q).join(',') + ') REFERENCES `' + fk.refTable + '` (' +
+        (fk.refColumns || []).map(q).join(',') + ')');
+    });
+    return 'CREATE TABLE `' + name + '` (\n  ' + lines.join(',\n  ') + '\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4';
+  }
+
+  /** SHOW COLUMNS / DESC 的结果集；full 为 true 时给出 SHOW FULL COLUMNS 的 9 列 */
+  function describeResult(meta, tableName, full) {
+    var rows = meta.columns.map(function (c) {
+      var dflt = c.hasDefault ? (c.defaultValue === null ? 'NULL' : c.defaultValue) : 'NULL';
+      if (full) {
+        var collation = /char|text|enum|set/i.test(String(c.type)) ? 'utf8mb4_0900_ai_ci' : null;
+        return [c.field, c.type, collation, c.nullable ? 'YES' : 'NO', c.key || '', dflt,
+          c.extra || '', 'select,insert,update,references', c.comment || ''];
+      }
+      return [c.field, c.type, c.nullable ? 'YES' : 'NO', c.key || '', dflt, c.extra || ''];
+    });
+    return full
+      ? rs(['Field', 'Type', 'Collation', 'Null', 'Key', 'Default', 'Extra', 'Privileges', 'Comment'], rows)
+      : rs(['Field', 'Type', 'Null', 'Key', 'Default', 'Extra'], rows);
   }
 
   function indexesResult(meta, tableName) {
@@ -989,8 +1986,10 @@ var MySQLCore = (function () {
   var UNSUPPORTED_STATEMENTS = [
     [/^\s*ALTER\s+TABLE\s+[\s\S]*\bADD\s+(?:CONSTRAINT\s+\S+\s+)?PRIMARY\s+KEY\b/i,
       'ALTER TABLE ... ADD PRIMARY KEY', '底层引擎无法为已存在的表追加主键（需要重建整张表）'],
-    [/^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:PROCEDURE|FUNCTION|TRIGGER|EVENT)\b/i,
-      'CREATE PROCEDURE / FUNCTION / TRIGGER / EVENT', '存储过程、自定义函数、触发器、事件均未实现'],
+    [/^\s*(?:CREATE(?:\s+OR\s+REPLACE)?|ALTER|DROP)\s+(?:DEFINER\s*=\s*\S+\s+)?(?:PROCEDURE|FUNCTION|TRIGGER|EVENT)\b/i,
+      'CREATE / ALTER / DROP PROCEDURE / FUNCTION / TRIGGER / EVENT', '存储过程、自定义函数、触发器、事件均未实现'],
+    [/^\s*CALL\b/i,
+      'CALL', '存储过程未实现，因此没有可调用的过程'],
     [/^\s*(?:PREPARE|EXECUTE|DEALLOCATE\s+PREPARE)\b/i,
       'PREPARE / EXECUTE / DEALLOCATE', '预处理语句未实现'],
     [/^\s*(?:GRANT|REVOKE)\b/i,
@@ -1005,6 +2004,32 @@ var MySQLCore = (function () {
       '多表写（UPDATE/DELETE ... JOIN）', '底层只支持单表写；可改写成 WHERE EXISTS (SELECT 1 FROM ...) 形式'],
     [/^\s*SELECT\b[\s\S]*\bWITH\s+ROLLUP\b/i,
       'GROUP BY ... WITH ROLLUP', '底层不会自动生成小计行'],
+    // ---- 结构级 MySQL 语法：本模拟器没实现，如实报 1235，不要伪装成 1064 ----
+    [/^\s*CREATE\s+TABLE\b[\s\S]*\bPARTITION\s+BY\b/i,
+      '分区表（PARTITION BY）', '底层引擎不支持表分区'],
+    [/^\s*CREATE\s+(?:FULLTEXT|SPATIAL)\s+(?:INDEX|KEY)\b|^\s*ALTER\s+TABLE\b[\s\S]*\bADD\s+(?:FULLTEXT|SPATIAL)\s+(?:INDEX|KEY)\b/i,
+      'FULLTEXT / SPATIAL 索引', '底层引擎没有全文索引与空间索引'],
+    [/^\s*SELECT\b[\s\S]*\bMATCH\s*\([\s\S]*\)\s*AGAINST\s*\(/i,
+      '全文检索 MATCH ... AGAINST', '全文检索需要 FULLTEXT 索引，底层引擎不支持'],
+    [/^\s*ALTER\s+TABLE\b[\s\S]*\bDROP\s+PRIMARY\s+KEY\b/i,
+      'ALTER TABLE ... DROP PRIMARY KEY', '底层引擎无法安全移除已存在的主键（需要重建整张表）'],
+    [/^\s*ALTER\s+TABLE\b[\s\S]*\b(?:DROP\s+FOREIGN\s+KEY|ADD\s+(?:CONSTRAINT\s+\S+\s+)?FOREIGN\s+KEY)\b/i,
+      'ALTER TABLE ... 外键（ADD / DROP FOREIGN KEY）', '建表时可以声明 FOREIGN KEY，但不支持建表之后增删外键'],
+    [/^\s*ALTER\s+TABLE\b[\s\S]*\b(?:ENGINE|ROW_FORMAT|AVG_ROW_LENGTH|KEY_BLOCK_SIZE|PACK_KEYS|STATS_\w+)\s*=/i,
+      'ALTER TABLE ... 表选项（ENGINE= / ROW_FORMAT= 等）', '底层引擎的表没有可修改的存储引擎等表属性'],
+    // ---- 复制与实例级管理：本模拟器是单连接、无实例概念 ----
+    [/^\s*(?:START|STOP)\s+(?:REPLICA|SLAVE)\b|^\s*CHANGE\s+(?:MASTER|REPLICATION\s+SOURCE)\b|^\s*RESET\s+(?:MASTER|REPLICA|SLAVE)\b/i,
+      '复制相关语句（START / STOP REPLICA、CHANGE MASTER 等）', '模拟器没有主从复制与二进制日志'],
+    [/^\s*PURGE\s+BINARY\s+LOGS\b|^\s*SHOW\s+BINLOG\b/i,
+      '二进制日志管理', '模拟器没有二进制日志'],
+    [/^\s*(?:INSTALL|UNINSTALL)\s+(?:PLUGIN|COMPONENT)\b/i,
+      'INSTALL / UNINSTALL PLUGIN', '模拟器不支持插件机制'],
+    [/^\s*HANDLER\b/i,
+      'HANDLER', 'HANDLER 是 MyISAM/InnoDB 的存储引擎级接口，模拟器未实现'],
+    [/^\s*XA\s+(?:START|BEGIN|END|PREPARE|COMMIT|ROLLBACK|RECOVER)\b/i,
+      'XA 分布式事务', '模拟器没有 XA 事务支持'],
+    [/^\s*(?:IMPORT\s+TABLE|CLONE)\b/i,
+      'IMPORT TABLE / CLONE', '模拟器没有表空间导入与实例克隆能力'],
     // 下面两条不是"本模拟器没做"，而是"MySQL 社区版本身就没有这条 SQL"，所以用 1064 更贴切
     [/^\s*(?:BACKUP|RESTORE)\s+(?:DATABASE|SCHEMA|TABLE|LOG|TABLESPACE|INSTANCE)\b/i,
       'BACKUP / RESTORE',
@@ -1047,12 +2072,14 @@ var MySQLCore = (function () {
     this.history = [];
     this.userVars = {};      // SET @x = ... 用户变量
     this.sessionVars = {};   // SET xxx = ... 会话变量（覆盖 SHOW VARIABLES 的默认值）
+    this.warnings = [];      // SHOW WARNINGS 的内容（由 DML 分支写入）
+    this.infoState = { lastInsertId: 0, rowCount: 0, foundRows: 0 };   // LAST_INSERT_ID()/ROW_COUNT()/FOUND_ROWS()
   }
 
   Engine.prototype.createDatabaseObject = function (name) {
     var db = new this.SQL.Database();
-    registerMySQLFunctions(db, name);
-    db.run('PRAGMA foreign_keys = OFF;');
+    registerMySQLFunctions(db, name, this.infoState);
+    db.run('PRAGMA foreign_keys = ON;');
     this.databases[name] = {
       name: name, db: db, tables: {}, views: {},
       isSystem: SYSTEM_DATABASES.indexOf(name) > -1
@@ -1077,27 +2104,38 @@ var MySQLCore = (function () {
     return Object.keys(this.databases);
   };
 
-  Engine.prototype.tableNames = function (dbName) {
-    var entry = this.databases[dbName || this.current];
-    if (!entry) return [];
+  /**
+   * 列出某个库里的对象名（type = 'table' | 'view'）。
+   * 关键点：SQLite 的 TEMPORARY 表/视图登记在 sqlite_temp_master，不在 sqlite_master，
+   * 所以必须两张表一起查 —— 否则 `CREATE TEMPORARY TABLE t` 之后 t 能读能写，
+   * 但 SHOW TABLES / DESC / 侧栏全都看不见它，用户会以为表没建成。
+   */
+  function objectNames(entry, type) {
     var names = [];
+    if (!entry) return names;
     try {
-      var r = entry.db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name");
+      var r = entry.db.exec(
+        "SELECT name FROM sqlite_master WHERE type='" + type + "' AND name NOT LIKE 'sqlite_%'" +
+        " UNION SELECT name FROM sqlite_temp_master WHERE type='" + type + "' AND name NOT LIKE 'sqlite_%'" +
+        " ORDER BY name");
       if (r[0]) names = r[0].values.map(function (v) { return v[0]; });
-    } catch (e) { /* ignore */ }
+    } catch (e) {
+      // 极老的内核没有 sqlite_temp_master：退回只查主库，不影响功能
+      try {
+        var r2 = entry.db.exec("SELECT name FROM sqlite_master WHERE type='" + type + "' AND name NOT LIKE 'sqlite_%' ORDER BY name");
+        if (r2[0]) names = r2[0].values.map(function (v) { return v[0]; });
+      } catch (e2) { /* ignore */ }
+    }
     return names;
+  }
+
+  Engine.prototype.tableNames = function (dbName) {
+    return objectNames(this.databases[dbName || this.current], 'table');
   };
 
-  /** 视图清单（以 sqlite_master 为准，避免与目录脱节） */
+  /** 视图清单（含临时视图，以 sqlite_master / sqlite_temp_master 为准，避免与目录脱节） */
   Engine.prototype.viewNames = function (dbName) {
-    var entry = this.databases[dbName || this.current];
-    if (!entry) return [];
-    var names = [];
-    try {
-      var r = entry.db.exec("SELECT name FROM sqlite_master WHERE type='view' AND name NOT LIKE 'sqlite_%' ORDER BY name");
-      if (r[0]) names = r[0].values.map(function (v) { return v[0]; });
-    } catch (e) { /* ignore */ }
-    return names;
+    return objectNames(this.databases[dbName || this.current], 'view');
   };
 
   Engine.prototype.viewExists = function (name, dbName) {
@@ -1385,10 +2423,272 @@ var MySQLCore = (function () {
     return blocks;
   };
 
+  /* ---- 8.1b EXPLAIN：把底层的查询计划翻译成 MySQL 形态 ---- */
+
+  /** 解析 SQLite 的 EXPLAIN QUERY PLAN 明细行（如 "SEARCH users USING INDEX idx_city (city=?)"） */
+  function parsePlanLine(detail) {
+    var d = String(detail).trim();
+    var m;
+    // SQLite 对 "SELECT 1" 这类无表查询给出 "SCAN CONSTANT ROW"，MySQL 会显示 No tables used
+    if (/^(?:SCAN|SEARCH)\s+(?:TABLE\s+)?CONSTANT\b/i.test(d)) return { op: 'other', table: null, raw: d };
+    var colsM = /\(([^)]*)\)/.exec(d);
+    var cols = colsM ? colsM[1].split(/\s+AND\s+/i).map(function (x) {
+      return x.trim().replace(/\s*=.*$/, '').replace(/^["'`[]|["'`\]]$/g, '');
+    }).filter(Boolean) : [];
+    if ((m = /^SCAN\s+(?:TABLE\s+)?([^\s(]+)/i.exec(d))) {
+      return { op: 'scan', table: m[1], cols: cols, raw: d };
+    }
+    if ((m = /^SEARCH\s+(?:TABLE\s+)?([^\s(]+)/i.exec(d))) {
+      var ci = /USING\s+COVERING\s+INDEX\s+([^\s(]+)/i.exec(d);
+      var ix = /USING\s+INDEX\s+([^\s(]+)/i.exec(d);
+      var pk = /USING\s+INTEGER\s+PRIMARY\s+KEY/i.test(d);
+      return { op: 'search', table: m[1], index: ci ? ci[1] : (ix ? ix[1] : null), covering: !!ci, pk: pk, cols: cols, raw: d };
+    }
+    return { op: 'other', table: null, raw: d };
+  }
+
+  function unquoteIdent(x) { return String(x).replace(/^["'`[]|["'`\]]$/g, ''); }
+
+  /**
+   * EXPLAIN <语句>：输出 MySQL 形态的执行计划。
+   * 旧实现是把 SQLite 的 EXPLAIN QUERY PLAN 原样打印（列名是 id/parent/notused/detail，
+   * 内容是 "SCAN users"），和 MySQL 的 12 列完全不是一回事，而"索引有没有被用上"
+   * 恰恰是教学重点。
+   */
+  Engine.prototype.explainStatement = function (stmt, format, analyze, vertical) {
+    var entry = this.databases[this.current];
+    if (!entry) return this.errBlock('ERROR 1046 (3D000): No database selected');
+    var self = this;
+    var translated;
+    try { translated = translateStatement(this.substituteVars(stmt), { db: this.current }); }
+    catch (e) { return this.errBlock(mapError(e.message, { db: this.current, stmt: stmt })); }
+
+    var planText = [];
+    try {
+      var pr = entry.db.exec('EXPLAIN QUERY PLAN ' + translated);
+      if (pr.length) planText = pr[0].values.map(function (r) { return String(r[3]); });
+    } catch (e) {
+      return this.errBlock(mapError(e.message, { db: this.current, stmt: stmt }));
+    }
+
+    var steps = planText.map(parsePlanLine);
+    var tableSteps = steps.filter(function (s) { return s.op !== 'other'; });
+    var extraBits = [];
+    steps.forEach(function (s) {
+      if (s.op !== 'other') return;
+      if (/TEMP B-TREE FOR ORDER BY/i.test(s.raw)) extraBits.push('Using filesort');
+      else if (/TEMP B-TREE/i.test(s.raw)) extraBits.push('Using temporary');
+      else if (/CO-ROUTINE|MATERIALIZE|UNION/i.test(s.raw)) extraBits.push(s.raw);
+    });
+    var hasWhere = /\bWHERE\b/i.test(stmt);
+    var rowCountOf = function (tname) {
+      try {
+        var c = entry.db.exec('SELECT COUNT(*) FROM "' + String(tname).replace(/"/g, '""') + '"');
+        if (c.length && c[0].values.length) return c[0].values[0][0];
+      } catch (e) { /* 视图/子查询表名取不到就报 0 */ }
+      return 0;
+    };
+
+    var rows = [];
+    tableSteps.forEach(function (st, i) {
+      var tname = unquoteIdent(st.table);
+      var meta = self.meta(tname) || { columns: [], indexes: [] };
+      var type = 'ALL', key = null, possible = null;
+      var extra = hasWhere ? 'Using where' : '';
+      if (st.op === 'scan') {
+        possible = (meta.indexes || []).filter(function (ix) {
+          if (ix.primary) return false;
+          return (ix.columns || []).some(function (c) { return new RegExp('\\b' + c + '\\b', 'i').test(stmt); });
+        }).map(function (ix) { return ix.name; }).join(',') || null;
+      } else if (st.pk) {
+        type = 'const'; key = 'PRIMARY';
+      } else if (st.index) {
+        type = st.covering ? 'index' : 'ref';
+        key = st.index;
+      }
+      // 唯一约束在底层是自动索引（sqlite_autoindex_users_1），要换回 MySQL 里声明的索引名
+      if (key && /^sqlite_autoindex_/i.test(key)) {
+        var lcCols = (st.cols || []).map(function (c) { return c.toLowerCase(); });
+        var pick = (meta.indexes || []).filter(function (ix) {
+          return (ix.columns || []).length && lcCols.indexOf(String(ix.columns[0]).toLowerCase()) > -1;
+        })[0] || (meta.indexes || []).filter(function (ix) { return ix.unique; })[0];
+        if (pick) key = pick.name;
+      }
+      rows.push([String(i + 1), 'SIMPLE', tname, null, type, possible, key, null, null,
+        rowCountOf(tname), '100.00', extra]);
+    });
+    if (extraBits.length && rows.length) {
+      var seen = {};
+      var merged = [rows[rows.length - 1][11]].concat(extraBits).filter(function (x) {
+        if (!x || seen[x]) return false;
+        seen[x] = 1;
+        return true;
+      });
+      rows[rows.length - 1][11] = merged.join('; ');
+    }
+
+    if (format === 'JSON') {
+      var tables = tableSteps.map(function (st) {
+        var tname = unquoteIdent(st.table);
+        var t = {
+          table_name: tname,
+          access_type: st.op === 'scan' ? 'ALL' : (st.pk ? 'const' : (st.covering ? 'index' : 'ref')),
+          rows_examined_per_scan: rowCountOf(tname),
+          filtered: '100.00'
+        };
+        if (st.index) t.possible_keys = [st.index];
+        if (st.pk) t.key = 'PRIMARY'; else if (st.index) t.key = st.index;
+        return t;
+      });
+      var qb = { query_block: { select_id: 1, cost_info: { query_cost: '0.00' }, table: tables } };
+      return [this.resultBlock(rs(['EXPLAIN'], [[JSON.stringify(qb, null, 2)]]), 1, vertical)];
+    }
+
+    if (format === 'TREE' || analyze) {
+      var lines = [];
+      var actual = 0;
+      if (analyze) {
+        try {
+          var ex = entry.db.exec(translated);
+          if (ex.length && ex[0].values.length) actual = ex[0].values.length;
+        } catch (e) { actual = 0; }
+        lines.push('-> ' + (hasWhere ? 'Filter: ' : '') + 'query  (cost=0.00 rows=' + actual +
+          ') (actual time=0.00..0.00 rows=' + actual + ' loops=1)');
+      }
+      tableSteps.forEach(function (st) {
+        var tname = unquoteIdent(st.table);
+        var n = rowCountOf(tname);
+        var kind = st.op === 'scan' ? 'Table scan' : (st.index ? 'Index lookup' : 'Search');
+        var on = st.op === 'scan' ? (' on ' + tname) : (' on ' + tname + ' using ' + (st.index || 'PRIMARY'));
+        lines.push('-> ' + kind + on + '  (cost=0.00 rows=' + n +
+          ') (actual time=0.00..0.00 rows=' + n + ' loops=1)');
+      });
+      if (!lines.length) lines.push('-> No tables in query');
+      // TREE / ANALYZE 在真实 mysql 客户端里是纯文本输出（不套表格框），这里保持一致
+      return [{ kind: 'out', text: lines.join('\n') }];
+    }
+
+    if (!rows.length) {
+      rows.push(['1', 'SIMPLE', null, null, null, null, null, null, null, null, null, 'No tables used']);
+    }
+    return [this.resultBlock(rs(['id', 'select_type', 'table', 'partitions', 'type', 'possible_keys',
+      'key', 'key_len', 'ref', 'rows', 'filtered', 'Extra'], rows), rows.length, vertical)];
+  };
+
+  /* ---- 8.1c CREATE TABLE ... AS SELECT 的列类型推导 ---- */
+
+  /** 从 SELECT 列表推导输出列名与 MySQL 类型（能对上源表列的用源列声明类型） */
+  Engine.prototype.ctasColumnTypes = function (selectSql, entry) {
+    var order = [], types = {};
+    var s = String(selectSql).replace(/;\s*$/, '').trim();
+    var fromIdx = topLevelKeywordIndex(s, 'FROM');
+    var list = (fromIdx > -1 ? s.slice(0, fromIdx) : s).replace(/^\s*SELECT\s+/i, '');
+    if (/^\s*DISTINCT\s+/i.test(list)) list = list.replace(/^\s*DISTINCT\s+/i, '');
+    var srcMeta = null;
+    if (fromIdx > -1) {
+      var tm = /^\s*FROM\s+(`[^`]+`|[A-Za-z0-9_$.]+)/i.exec(s.slice(fromIdx));
+      if (tm) {
+        var tok = splitDbTable(tm[1]);
+        srcMeta = entry.tables[tok.table] || this.meta(tok.table, tok.db || undefined);
+      }
+    }
+    if (/^\s*\*\s*$/.test(list)) {
+      if (srcMeta) srcMeta.columns.forEach(function (c) { order.push(c.field); types[c.field] = c.type; });
+      return { order: order, types: types };
+    }
+    splitTopLevel(list).forEach(function (item) {
+      var it = item.trim();
+      var asM = /\s+AS\s+(`[^`]+`|[A-Za-z0-9_$]+)\s*$/i.exec(it);
+      var expr = asM ? it.slice(0, asM.index).trim() : it;
+      var outName;
+      if (asM) outName = stripQuotes(asM[1]);
+      else {
+        var bare = /^(?:`?[A-Za-z0-9_$]+`?\.)?(`[^`]+`|[A-Za-z0-9_$]+)$/.exec(expr);
+        outName = bare ? stripQuotes(bare[1]) : expr.replace(/[^A-Za-z0-9_$]/g, '_');
+      }
+      var t = null;
+      var colM = /^(?:`?[A-Za-z0-9_$]+`?\.)?`?([A-Za-z0-9_$]+)`?$/.exec(expr);
+      if (colM && srcMeta) {
+        var hit = (srcMeta.columns || []).filter(function (c) {
+          return c.field.toLowerCase() === colM[1].toLowerCase();
+        })[0];
+        if (hit) t = hit.type;
+      }
+      order.push(outName);
+      types[outName] = t || inferExprType(expr);
+    });
+    return { order: order, types: types };
+  };
+
+  /** 为 CTAS 建出来的表补一份 MySQL 风格的列目录（否则 DESC 会显示 SQLite 的 int/text/num） */
+  Engine.prototype.buildCtasMeta = function (name, selectSql) {
+    var entry = this.databases[this.current];
+    if (!entry) return null;
+    var derived = this.ctasColumnTypes(selectSql, entry);
+    var cols = [];
+    try {
+      var info = entry.db.exec('PRAGMA table_info("' + String(name).replace(/"/g, '""') + '")');
+      var names = info[0] ? info[0].values.map(function (r) { return r[1]; }) : derived.order;
+      cols = names.map(function (n) {
+        return {
+          field: n, type: derived.types[n] || 'varchar(255)',
+          nullable: true, key: '', hasDefault: false, defaultValue: null, extra: '', comment: ''
+        };
+      });
+    } catch (e) { /* ignore */ }
+    return { name: name, columns: cols, indexes: [], foreignKeys: [], autoIncrementNext: null, raw: '' };
+  };
+
+  /* ---- 8.1d AUTO_INCREMENT 起始值 ---- */
+
+  /**
+   * 让 `AUTO_INCREMENT = N` 真正生效。
+   * 底层自增是 INTEGER PRIMARY KEY（= rowid 别名），起始值由 SQLite 自己分配、无法直接设置，
+   * 所以在 INSERT 时把自增列的显式值补上。只处理最常见的 INSERT ... VALUES 形式，
+   * 其余形式（INSERT ... SELECT 等）保持底层行为，并在 DIFFERENCES 里说明。
+   */
+  Engine.prototype.applyAutoIncrement = function (entry, sql) {
+    var m = /^\s*INSERT\s+(?:OR\s+IGNORE\s+)?INTO\s+(`([^`]+)`|[A-Za-z0-9_$.]+)\s*(?:\(([^)]*)\))?\s*VALUES\s*([\s\S]+)$/i.exec(sql);
+    if (!m) return sql;
+    var tname = stripQuotes(m[2] || m[1]).split('.').pop();
+    var meta = entry.tables[tname];
+    if (!meta || !meta.autoIncrementNext) return sql;
+    var aiCol = (meta.columns || []).filter(function (c) { return /auto_increment/i.test(c.extra || ''); })[0];
+    if (!aiCol) return sql;
+    var colList = m[3] ? splitTopLevel(m[3]).map(function (x) { return stripQuotes(x.trim()); }) : null;
+    if (colList && colList.some(function (c) { return c.toLowerCase() === aiCol.field.toLowerCase(); })) {
+      return sql;   // 用户自己给了自增列的值
+    }
+    if (!colList) {
+      var firstCol = (meta.columns || [])[0];
+      if (!firstCol || firstCol.field.toLowerCase() !== aiCol.field.toLowerCase()) return sql;
+    }
+    var valuesPart = m[4].trim().replace(/;\s*$/, '');
+    var rowsRaw = splitTopLevel(valuesPart);
+    if (!rowsRaw.length || !rowsRaw.every(function (r) { return /^\s*\([\s\S]*\)\s*$/.test(r); })) return sql;
+    var next = meta.autoIncrementNext;
+    var newRows = rowsRaw.map(function (r) {
+      var vals = splitTopLevel(r.trim().slice(1, -1));
+      var outVals = [String(next)].concat(vals.map(function (v) { return v.trim(); }));
+      next++;
+      return '(' + outVals.join(', ') + ')';
+    });
+    var newCols = colList ? [aiCol.field].concat(colList) : null;
+    this._pendingAutoInc = { meta: meta, next: next };
+    return 'INSERT INTO ' + m[1] + (newCols ? ' (' + newCols.join(', ') + ')' : '') +
+      ' VALUES ' + newRows.join(', ') + ';';
+  };
+
   Engine.prototype.runOne = function (sql, vertical) {
     var out = [];
     var self = this;
     this._lastVertical = !!vertical;
+
+    // MySQL 的警告列表是"每条语句一份"：新语句开始时清空，
+    // 但 SHOW WARNINGS / SHOW COUNT(*) WARNINGS 本身要能看到上一条语句产生的警告。
+    if (!/^\s*show\s+(?:warnings|errors|count\s*\(\s*\*\s*\)\s+(?:warnings|errors))/i.test(sql.trim())) {
+      this.warnings = [];
+    }
 
     // ---- 客户端元命令 ----
     var lower = sql.trim().toLowerCase().replace(/;\s*$/, '');
@@ -1397,8 +2697,13 @@ var MySQLCore = (function () {
       out.push({ kind: 'exit', text: '' });
       return out;
     }
-    if (lower === '\\h' || lower === 'help' || lower === '\\?') {
+    if (lower === '\\h' || lower === 'help' || lower === '\\?' || /^help\s+\S/.test(lower)) {
       out.push({ kind: 'out', text: HELP_TEXT });
+      var helpTopic = lower.replace(/^(?:help|\?)\s*/, '').trim();
+      if (helpTopic) {
+        out.push({ kind: 'note', text: '（提示：真实 mysql 客户端会针对「' + helpTopic + '」显示该命令的语法帮助；' +
+          '本模拟器只提供上面这份常用命令一览。）' });
+      }
       return out;
     }
     if (lower === '\\s' || lower === 'status') {
@@ -1498,18 +2803,51 @@ var MySQLCore = (function () {
       }
       return out;
     }
-    // ---- CHECK TABLE：做真实的存在性检查并回报 status ----
-    var ckM = /^CHECK\s+TABLE\s+([`A-Za-z0-9_$.,\s]+)$/i.exec(sql.trim());
-    if (ckM) {
-      var ckEntry = this.databases[this.current] || this.databases.mysql;
-      var ckNames = ckM[1].split(',').map(function (x) { return x.trim().replace(/^`|`$/g, ''); }).filter(Boolean);
-      var ckMiss = ckNames.filter(function (nm) { return !(ckEntry && ckEntry.tables[nm]); });
-      if (ckMiss.length) {
-        out.push({ kind: 'err', text: 'ERROR 1146 (42S02): Table \'' + this.current + '.' + ckMiss[0] + '\' doesn\'t exist' });
+    // ---- 表维护语句：CHECK / OPTIMIZE / REPAIR / ANALYZE TABLE ----
+    // MySQL 统一返回 Table / Op / Msg_type / Msg_text 结果集。
+    // （旧实现把 OPTIMIZE/REPAIR 转译成 `SELECT 1 WHERE 0`，终端上只打印一句 "Empty set"。）
+    var maintM = /^(CHECK|OPTIMIZE|REPAIR|ANALYZE)\s+TABLE\s+([`A-Za-z0-9_$.,\s]+)$/i.exec(sql.trim());
+    if (maintM) {
+      var mOp = maintM[1].toLowerCase();
+      var mtEntry = this.databases[this.current] || this.databases.mysql;
+      var mtNames = maintM[2].split(',').map(function (x) { return stripQuotes(x.trim()); }).filter(Boolean);
+      var mtMiss = mtNames.filter(function (nm) {
+        if (mtEntry && mtEntry.tables[nm]) return false;
+        return !self.viewExists(nm);
+      });
+      if (mtMiss.length) {
+        out.push({ kind: 'err', text: 'ERROR 1146 (42S02): Table \'' + this.current + '.' + mtMiss[0] + '\' doesn\'t exist' });
         return out;
       }
-      var ckRows = ckNames.map(function (nm) { return [nm, 'check', 'status', 'OK']; });
-      return [this.resultBlock(rs(['Table', 'Op', 'Msg_type', 'Msg_text'], ckRows), ckRows.length)];
+      var mtRows = [];
+      mtNames.forEach(function (nm) {
+        if (mOp === 'optimize') {
+          mtRows.push([nm, 'optimize', 'note', 'Table does not support optimize, doing recreate + analyze instead']);
+        } else if (mOp === 'repair') {
+          mtRows.push([nm, 'repair', 'note', 'The storage engine for the table doesn\'t support repair']);
+        }
+        mtRows.push([nm, mOp, 'status', 'OK']);
+      });
+      return [this.resultBlock(rs(['Table', 'Op', 'Msg_type', 'Msg_text'], mtRows), mtRows.length)];
+    }
+    // ---- FLUSH ...：单连接、全内存，没有缓存或日志可刷，如实说明后回 Query OK ----
+    if (/^FLUSH\b/i.test(sql.trim())) {
+      var flM = /^FLUSH\s+(?:NO_WRITE_TO_BINLOG\s+|LOCAL\s+)?TABLES\s+([`A-Za-z0-9_$.,\s]+)$/i.exec(sql.trim());
+      if (flM) {
+        var flEntry = this.databases[this.current] || this.databases.mysql;
+        var flNames = flM[1].split(',').map(function (x) { return stripQuotes(x.trim()); }).filter(Boolean);
+        var flMiss = flNames.filter(function (nm) { return !(flEntry && flEntry.tables[nm]); });
+        if (flMiss.length) {
+          out.push({ kind: 'err', text: 'ERROR 1146 (42S02): Table \'' + this.current + '.' + flMiss[0] + '\' doesn\'t exist' });
+          return out;
+        }
+      }
+      out.push({ kind: 'out', text: 'Query OK, 0 rows affected (' + formatDuration(0.0005) + ' sec)' });
+      if (!this._flushNoted) {
+        this._flushNoted = true;
+        out.push({ kind: 'note', text: '（提示：模拟器只有一个连接、数据全在内存里，FLUSH 没有实际的缓存或日志可刷新，语句被接受但不产生效果。）' });
+      }
+      return out;
     }
     // ---- DELIMITER：客户端命令，本模拟器按整句解析，接受后忽略 ----
     if (/^DELIMITER\s+\S+/i.test(sql.trim())) return out;
@@ -1535,8 +2873,54 @@ var MySQLCore = (function () {
       }
       return out;
     }
+    // ---- INSERT / REPLACE ... SET col = val, ...（MySQL 特有写法，转成标准 VALUES 形式）----
+    var insSetM = /^(INSERT|REPLACE)\s+(IGNORE\s+)?INTO\s+(`[^`]+`|[A-Za-z0-9_$.]+)\s+SET\s+([\s\S]+)$/i.exec(trimmed);
+    if (insSetM) {
+      var setPairs = splitTopLevel(insSetM[4]);
+      var setCols = [], setVals = [], setBad = false;
+      setPairs.forEach(function (p) {
+        var pm = /^\s*(`[^`]+`|[A-Za-z0-9_$]+)\s*=\s*([\s\S]+)$/.exec(p);
+        if (!pm) { setBad = true; return; }
+        setCols.push(pm[1]);
+        setVals.push(pm[2].trim());
+      });
+      if (setBad || !setCols.length) {
+        out.push({ kind: 'err', text: 'ERROR 1064 (42000): You have an error in your SQL syntax near \'SET\'' });
+        return out;
+      }
+      return this.runOne(insSetM[1].toUpperCase() + ' ' + (insSetM[2] || '') + 'INTO ' + insSetM[3] +
+        ' (' + setCols.join(', ') + ') VALUES (' + setVals.join(', ') + ');', vertical);
+    }
+
+    // ---- SELECT ... INTO @var[, @var2]（MySQL 常用写法；一条 SELECT 只取第一行，与 MySQL 一致）----
+    var selIntoM = /^SELECT\s+([\s\S]+?)\s+INTO\s+((?:@@?[A-Za-z0-9_$.]+)(?:\s*,\s*@@?[A-Za-z0-9_$.]+)*)\s*(FROM\b[\s\S]*)?$/i.exec(trimmed);
+    if (selIntoM) {
+      var siEntry = this.databases[this.current];
+      if (!siEntry) { out.push({ kind: 'err', text: 'ERROR 1046 (3D000): No database selected' }); return out; }
+      var siSql = 'SELECT ' + selIntoM[1].trim() + (selIntoM[3] ? ' ' + selIntoM[3].trim() : '');
+      try {
+        var siEx = siEntry.db.exec(translateStatement(this.substituteVars(siSql), { db: this.current }));
+        var siNames = selIntoM[2].split(',').map(function (x) { return x.trim(); });
+        if (siEx.length && siEx[0].values.length) {
+          var siRow = siEx[0].values[0];
+          siNames.forEach(function (nm, i) {
+            var siSys = nm.charAt(0) === '@' && nm.charAt(1) === '@';
+            var siKey = nm.replace(/^@@?/, '');
+            if (siSys) self.sessionVars[siKey.toLowerCase()] = siRow[i];
+            else self.userVars[siKey] = siRow[i];
+          });
+          out.push({ kind: 'out', text: 'Query OK, 1 row affected (' + formatDuration(0.001) + ' sec)' });
+        } else {
+          out.push({ kind: 'err', text: 'ERROR 1329 (02000): No data - zero rows fetched, selected, or processed' });
+        }
+      } catch (e) {
+        out.push({ kind: 'err', text: mapError(e.message, { db: this.current, stmt: siSql }) });
+      }
+      return out;
+    }
+
     // ---- DROP TABLE a, b, c（MySQL 允许一次删多张表）----
-    var dtM = /^DROP\s+TABLE\s+(IF\s+EXISTS\s+)?([`A-Za-z0-9_$.,\s]+)$/i.exec(trimmed);
+    var dtM = /^DROP\s+(?:TEMPORARY\s+)?TABLE\s+(IF\s+EXISTS\s+)?([`A-Za-z0-9_$.,\s]+)$/i.exec(trimmed);
     if (dtM && dtM[2].indexOf(',') > -1) {
       dtM[2].split(',').forEach(function (t) {
         self.runOne('DROP TABLE ' + (dtM[1] || '') + t.trim() + ';').forEach(function (b) { out.push(b); });
@@ -1544,11 +2928,22 @@ var MySQLCore = (function () {
       return out;
     }
 
-    // ---- DESC / DESCRIBE / EXPLAIN <table> ----
-    var descM = /^(?:DESC|DESCRIBE|EXPLAIN)\s+(?:`([^`]+)`|([A-Za-z0-9_$.]+))\s*(?:(`[^`]+`|\S+))?\s*$/i.exec(sql.trim());
+    // ---- EXPLAIN <语句>：输出 MySQL 形态的执行计划（必须早于下面的 DESC 分支，
+    //      否则 "EXPLAIN SELECT 1" 会被当成 DESC 表 SELECT 列 1）----
+    var exM = /^EXPLAIN\s+(?:FORMAT\s*=\s*(TRADITIONAL|JSON|TREE)\s+)?(ANALYZE\s+)?([\s\S]+)$/i.exec(trimmed);
+    if (exM && /^(SELECT|WITH|INSERT|UPDATE|DELETE|REPLACE)\b/i.test(exM[3].trim())) {
+      return this.explainStatement(exM[3].trim(), (exM[1] || 'TRADITIONAL').toUpperCase(), !!exM[2], vertical);
+    }
+    // ---- DESC / DESCRIBE / EXPLAIN <table> [col | 'pattern'] ----
+    // MySQL 里 DESC tbl col 等价于 SHOW COLUMNS FROM tbl LIKE 'col'，DESC tbl 'p%' 同理；
+    // 旧实现把尾部的列名/模式整个丢掉，导致过滤条件被静默忽略。
+    var descM = /^(?:DESC|DESCRIBE|EXPLAIN)\s+(?:`([^`]+)`|([A-Za-z0-9_$.]+))\s*(?:('(?:[^']|'')*')|(`[^`]+`|[A-Za-z0-9_$]+))?\s*$/i.exec(sql.trim());
     if (descM) {
-      var tname = descM[1] || descM[2];
-      return this.describeTable(tname);
+      var dtTok = splitDbTable(descM[1] || descM[2]);
+      var dpRaw = descM[4] || descM[3];
+      var dPattern = null;
+      if (dpRaw) dPattern = /^'/.test(dpRaw) ? stripQuotes(dpRaw).split("''").join("'") : stripQuotes(dpRaw);
+      return this.describeTable(dtTok.table, dtTok.db, dPattern, false);
     }
     // ---- CREATE / DROP DATABASE ----
     var cdM = /^CREATE\s+(?:DATABASE|SCHEMA)\s+(IF\s+NOT\s+EXISTS\s+)?(`([^`]+)`|[A-Za-z0-9_$]+)/i.exec(sql.trim());
@@ -1690,7 +3085,7 @@ var MySQLCore = (function () {
     }
 
     // ---- DROP TABLE 命中视图：说清是 1347，而不是"表不存在" ----
-    var dtViewM = /^DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(`([^`]+)`|[A-Za-z0-9_$]+)\s*$/i.exec(trimmed);
+    var dtViewM = /^DROP\s+(?:TEMPORARY\s+)?TABLE\s+(?:IF\s+EXISTS\s+)?(`([^`]+)`|[A-Za-z0-9_$]+)\s*$/i.exec(trimmed);
     if (dtViewM && !entry.tables[stripQuotes(dtViewM[2] || dtViewM[1])]) {
       var dtvName = stripQuotes(dtViewM[2] || dtViewM[1]);
       if (this.viewExists(dtvName)) {
@@ -1730,6 +3125,30 @@ var MySQLCore = (function () {
         out.push({ kind: 'out', text: 'Query OK, 0 rows affected (' + formatDuration(0.005) + ' sec)' });
       } catch (e) {
         out.push({ kind: 'err', text: mapError(e.message, { db: this.current }) });
+      }
+      return out;
+    }
+
+    // ---- ALTER TABLE ... AUTO_INCREMENT = N（设置下一次自增的起始值）----
+    var aiAlterM = /^ALTER\s+TABLE\s+(`([^`]+)`|[A-Za-z0-9_$.]+)\s+AUTO_INCREMENT\s*=\s*(\d+)\s*$/i.exec(trimmed);
+    if (aiAlterM) {
+      var aiTbl = stripQuotes(aiAlterM[2] || aiAlterM[1]);
+      var aiMeta2 = entry.tables[aiTbl];
+      if (!aiMeta2) {
+        out.push({ kind: 'err', text: 'ERROR 1146 (42S02): Table \'' + this.current + '.' + aiTbl + '\' doesn\'t exist' });
+        return out;
+      }
+      var aiHasCol = (aiMeta2.columns || []).some(function (c) { return /auto_increment/i.test(c.extra || ''); });
+      if (!aiHasCol) {
+        out.push({ kind: 'err', text: 'ERROR 1075 (42000): Incorrect table definition; there can be only one auto column and it must be defined as a key' });
+        return out;
+      }
+      aiMeta2.autoIncrementNext = Number(aiAlterM[3]);
+      out.push({ kind: 'out', text: 'Query OK, 0 rows affected (' + formatDuration(0.004) + ' sec)' });
+      if (!this._aiNoted) {
+        this._aiNoted = true;
+        out.push({ kind: 'note', text: '（提示：AUTO_INCREMENT 起始值对后续 INSERT 生效；' +
+          '自增步长（auto_increment_increment）与 INSERT ... SELECT 形式的自动编号仍不支持。）' });
       }
       return out;
     }
@@ -1856,20 +3275,50 @@ var MySQLCore = (function () {
 
     var isCreateTable = /^\s*CREATE\s+(?:TEMPORARY\s+)?TABLE\b/i.test(sql);
     var metaParsed = isCreateTable ? parseCreateTable(sql) : null;
+    // CREATE TABLE ... AS SELECT：底层建出来的列声明是 SQLite 的，需要另外补 MySQL 风格目录
+    var ctasM = isCreateTable
+      ? /^CREATE\s+(?:TEMPORARY\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(`([^`]+)`|[A-Za-z0-9_$.]+)\s+AS\s+([\s\S]+)$/i.exec(trimmed)
+      : null;
+    // 行锁语义被丢弃（见 translateStatement 末尾）：执行完要如实提示，不能让用户以为锁生效了
+    var hadLockClause = /\s+FOR\s+UPDATE\b|\s+LOCK\s+IN\s+SHARE\s+MODE\b/i.test(sql);
     // 执行前展开 @x / @@x 变量（引号内的 @ 不会被误替换）
     var sqlExec = sql;
     if (!isCreateTable) {
       try { sqlExec = this.substituteVars(sql); }
       catch (e) { out.push({ kind: 'err', text: mapError(e.message, { db: this.current }) }); return out; }
     }
-    var translated = translateStatement(sqlExec, { db: this.current });
+    var tctx = { db: this.current, notes: [] };
+    // AUTO_INCREMENT 起始值：把自增列的显式值补进 INSERT（只有设置过起始值的表才需要）
+    this._pendingAutoInc = null;
+    if (!isCreateTable) {
+      var aiRewritten = this.applyAutoIncrement(entry, sqlExec);
+      if (aiRewritten !== sqlExec) sqlExec = aiRewritten;
+    }
+    var translated = translateStatement(sqlExec, tctx);
     var t0 = Date.now();
     var usedMemory = false;
+    var execFailed = false;
 
     try {
       if (/^\s*(SELECT|WITH|PRAGMA|EXPLAIN\s+QUERY|VALUES)\b/i.test(translated)) {
         var results = entry.db.exec(translated);
         var sec = (Date.now() - t0) / 1000;
+        // ROW_COUNT() 在 MySQL 里对 SELECT 返回 -1；FOUND_ROWS() 只在用了
+        // SQL_CALC_FOUND_ROWS 时才有意义（该写法在 MySQL 8.0.17 已废弃，这里如实实现）
+        this.infoState.rowCount = -1;
+        if (/\bSQL_CALC_FOUND_ROWS\b/i.test(sql)) {
+          try {
+            var noLim = translated.replace(/\s+LIMIT\s+\d+(?:\s+OFFSET\s+\d+)?\s*$/i, '').replace(/\s+OFFSET\s+\d+\s*$/i, '');
+            var allRows = entry.db.exec(noLim);
+            this.infoState.foundRows = allRows.length ? allRows[0].values.length : 0;
+          } catch (e) { this.infoState.foundRows = 0; }
+        } else {
+          this.infoState.foundRows = 0;
+        }
+        // 记下最后一个结果集，供界面导出 CSV / JSON（app.js 读取）
+        this.lastResultSet = results.length
+          ? { columns: results[0].columns.slice(), values: results[0].values }
+          : null;
         if (!results.length) {
           out.push({ kind: 'out', text: 'Empty set (' + formatDuration(sec) + ' sec)' });
         } else {
@@ -1879,8 +3328,7 @@ var MySQLCore = (function () {
           });
         }
       } else {
-        entry.db.run(translated);
-        var sec2 = (Date.now() - t0) / 1000;
+        entry.db.run(translated);        var sec2 = (Date.now() - t0) / 1000;
         // 同步 catalog
         if (metaParsed) {
           entry.tables[metaParsed.name] = metaParsed;
@@ -1891,8 +3339,26 @@ var MySQLCore = (function () {
           var isDml = /^\s*(INSERT|REPLACE|UPDATE|DELETE)\b/i.test(translated);
           var cnt = 0;
           if (isDml) { try { cnt = entry.db.getRowsModified(); } catch (e) { cnt = 0; } }
+          if (isDml) {
+            this.infoState.rowCount = cnt;
+            // LAST_INSERT_ID() 只在 INSERT/REPLACE 后更新（MySQL 语义）
+            if (/^\s*(INSERT|REPLACE)\b/i.test(translated)) {
+              try {
+                var li = entry.db.exec('SELECT last_insert_rowid()');
+                if (li.length && li[0].values.length) this.infoState.lastInsertId = li[0].values[0][0];
+              } catch (e) { /* ignore */ }
+            }
+            // INSERT IGNORE 被唯一键挡掉时，MySQL 会给一条 1062 警告
+            if (/^\s*INSERT\s+OR\s+IGNORE\b/i.test(translated) && cnt === 0) {
+              this.addWarning('Warning', 1062, 'Duplicate entry - INSERT IGNORE 跳过了这条记录');
+            }
+          }
           if (/^\s*TRUNCATE\b/i.test(sql)) {
-            // MySQL 的 TRUNCATE 回报 0 rows affected（此处底层是 DELETE）
+            // MySQL 的 TRUNCATE 回报 0 rows affected（此处底层是 DELETE），
+            // 同时会把 AUTO_INCREMENT 计数器重置回 1
+            var trM = /^\s*TRUNCATE\s+(?:TABLE\s+)?`?([A-Za-z0-9_$.]+)`?/i.exec(sql);
+            var trMeta = trM ? entry.tables[trM[1].split('.').pop()] : null;
+            if (trMeta) trMeta.autoIncrementNext = null;
             out.push({ kind: 'out', text: 'Query OK, 0 rows affected (' + formatDuration(sec2) + ' sec)' });
           } else if (/^\s*(COMMIT|BEGIN|START|ROLLBACK|SET|SAVEPOINT|RELEASE)\b/i.test(translated)) {
             out.push({ kind: 'out', text: 'Query OK, 0 rows affected (' + formatDuration(sec2) + ' sec)' });
@@ -1901,12 +3367,41 @@ var MySQLCore = (function () {
           }
           // DROP / ALTER / RENAME / CREATE INDEX 后同步 catalog
           this.syncCatalogAfter(entry, translated);
+          // INSERT 成功后推进 AUTO_INCREMENT 计数器
+          if (this._pendingAutoInc) {
+            this._pendingAutoInc.meta.autoIncrementNext = this._pendingAutoInc.next;
+            this._pendingAutoInc = null;
+          }
+          // CREATE TABLE ... AS SELECT：补一份 MySQL 风格的列目录
+          if (ctasM) {
+            var ctasName = stripQuotes(ctasM[2] || ctasM[1]);
+            var ctasMeta = this.buildCtasMeta(ctasName, ctasM[3]);
+            if (ctasMeta) entry.tables[ctasName] = ctasMeta;
+          }
         }
       }
     } catch (e) {
       var dup = null;
       try { dup = this.findDuplicateValue(entry, translated, e.message); } catch (e2) { dup = null; }
       out.push({ kind: 'err', text: mapError(e.message, { db: this.current, dupValue: dup, stmt: sql }) });
+      execFailed = true;
+    }
+    // 诚实维护警告列表（SHOW WARNINGS 用）：除零是 MySQL 会给警告的典型场景
+    if (!execFailed && /\/\s*0(?![.\d])/.test(sql)) this.addWarning('Warning', 1365, 'Division by 0');
+    // 转译阶段的诚实提示（例如 GROUP_CONCAT(DISTINCT ... SEPARATOR ...) 的等价实现说明），
+    // 每条只在会话里提示一次，避免刷屏
+    if (tctx.notes && tctx.notes.length) {
+      this._xlateNotes = this._xlateNotes || {};
+      tctx.notes.forEach(function (n) {
+        if (self._xlateNotes[n]) return;
+        self._xlateNotes[n] = 1;
+        out.push({ kind: 'note', text: n });
+      });
+    }
+    if (hadLockClause && !this._lockClauseNoted) {
+      this._lockClauseNoted = true;
+      out.push({ kind: 'note', text: '（提示：FOR UPDATE / LOCK IN SHARE MODE 的加锁语义被忽略——模拟器只有单个连接、没有行级锁，' +
+        '不过 SELECT 返回的数据本身是真实的。）' });
     }
     return out;
   };
@@ -1978,39 +3473,49 @@ var MySQLCore = (function () {
     var r = rest.trim().replace(/;$/, '');
     var m;
 
-    if (/^DATABASES\b/i.test(r) || /^SCHEMAS\b/i.test(r)) {
-      var dbList = this.databaseNames().sort();
-      return [this.resultBlock(rs(['Database'], dbList.map(function (n) { return [n]; })), dbList.length, vertical)];
+    if ((m = /^(?:DATABASES|SCHEMAS)\b([\s\S]*)$/i.exec(r))) {
+      var dbRows = this.databaseNames().sort().map(function (n) { return [n]; });
+      var dbF = filterShowRows(dbRows, m[1], ['Database']);
+      var dbBlocks = [this.resultBlock(rs(['Database'], dbF.rows), dbF.rows.length, vertical)];
+      if (dbF.unsupported) dbBlocks.push({ kind: 'note', text: SHOW_FILTER_NOTE });
+      return dbBlocks;
     }
-    if ((m = /^TABLES\s*(?:FROM|IN)\s+(`([^`]+)`|[A-Za-z0-9_$]+)(?:\s+LIKE\s+'([^']*)')?/i.exec(r)) || /^TABLES(?:\s+LIKE\s+'([^']*)')?$/i.test(r)) {
-      var dbName = m ? stripQuotes(m[2] || m[1]) : this.current;
-      var like = m ? m[3] : (/^TABLES\s+LIKE\s+'([^']*)'$/i.exec(r) || [])[1];
+    if ((m = /^TABLES\b([\s\S]*)$/i.exec(r))) {
+      var tblDbM = /^\s*(?:FROM|IN)\s+(`([^`]+)`|[A-Za-z0-9_$]+)([\s\S]*)$/i.exec(m[1]);
+      var dbName = tblDbM ? stripQuotes(tblDbM[2] || tblDbM[1]) : this.current;
+      var tblTail = tblDbM ? tblDbM[3] : m[1];
       if (!this.databases[dbName]) return this.errBlock('ERROR 1049 (42000): Unknown database \'' + dbName + '\'');
-      // 真实 MySQL 的 SHOW TABLES 会把视图一并列出
+      // 真实 MySQL 的 SHOW TABLES 会把视图与临时表一并列出
       var names = this.tableNames(dbName).concat(this.viewNames(dbName)).sort();
-      if (like) {
-        var rx = new RegExp('^' + like.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '.*').replace(/_/g, '.') + '$', 'i');
-        names = names.filter(function (n) { return rx.test(n); });
-      }
-      return [this.resultBlock(rs(['Tables_in_' + dbName], names.map(function (n) { return [n]; })), names.length)];
+      var fT = filterShowRows(names.map(function (n) { return [n]; }), tblTail, ['Tables_in_' + dbName]);
+      var tblBlocks = [this.resultBlock(rs(['Tables_in_' + dbName], fT.rows), fT.rows.length)];
+      if (fT.unsupported) tblBlocks.push({ kind: 'note', text: SHOW_FILTER_NOTE });
+      return tblBlocks;
     }
-    if ((m = /^(?:FULL\s+)?COLUMNS\s+(?:FROM|IN)\s+(`[^`]+`|[A-Za-z0-9_$.]+)(?:\s+(?:FROM|IN)\s+(`[^`]+`|[A-Za-z0-9_$]+))?/i.exec(r)) ||
-        (m = /^(?:FULL\s+)?FIELDS\s+(?:FROM|IN)\s+(`[^`]+`|[A-Za-z0-9_$.]+)(?:\s+(?:FROM|IN)\s+(`[^`]+`|[A-Za-z0-9_$]+))?/i.exec(r))) {
-      var t = stripQuotes(m[1]), dbw = m[2] ? stripQuotes(m[2]) : null;
-      return this.describeTable(t, dbw);
+    if ((m = /^(FULL\s+)?(?:COLUMNS|FIELDS)\s+(?:FROM|IN)\s+(`[^`]+`|[A-Za-z0-9_$.]+)(?:\s+(?:FROM|IN)\s+(`[^`]+`|[A-Za-z0-9_$]+))?([\s\S]*)$/i.exec(r))) {
+      var cTok = splitDbTable(m[2]);
+      var cDb = m[3] ? stripQuotes(m[3]) : cTok.db;
+      var cTail = m[4] || '';
+      var cLikeM = /\bLIKE\s+'((?:[^']|'')*)'/i.exec(cTail);
+      var cWhereM = /\bWHERE\s+`?Field`?\s*=\s*'((?:[^']|'')*)'/i.exec(cTail);
+      var cPat = cLikeM ? cLikeM[1].split("''").join("'")
+        : (cWhereM ? cWhereM[1].split("''").join("'") : null);
+      return this.describeTable(cTok.table, cDb, cPat, !!m[1]);
     }
     // SHOW CREATE VIEW —— 视图定义
     if ((m = /^CREATE\s+VIEW\s+(`[^`]+`|[A-Za-z0-9_$.]+)/i.exec(r))) {
-      var vn = stripQuotes(m[1]).split('.').pop();
-      if (this.tableExists(vn)) return this.errBlock('ERROR 1347 (HY000): \'' + this.current + '.' + vn + '\' is not VIEW');
-      var vdef = this.viewDef(vn);
-      if (!vdef) return this.errBlock('ERROR 1051 (42S02): Unknown table \'' + this.current + '.' + vn + '\'');
+      var vTok = splitDbTable(m[1]);
+      var vn = vTok.table, vdb = vTok.db || this.current;
+      if (this.tableExists(vn, vdb)) return this.errBlock('ERROR 1347 (HY000): \'' + vdb + '.' + vn + '\' is not VIEW');
+      var vdef = this.viewDef(vn, vdb);
+      if (!vdef) return this.errBlock('ERROR 1051 (42S02): Unknown table \'' + vdb + '.' + vn + '\'');
       return [this.resultBlock(rs(['View', 'Create View', 'character_set_client', 'collation_connection'],
         [[vn, vdef.createSql, 'utf8mb4', 'utf8mb4_0900_ai_ci']]), 1, vertical)];
     }
     if ((m = /^CREATE\s+TABLE\s+(`[^`]+`|[A-Za-z0-9_$.]+)(?:\s+FROM\s+(`[^`]+`|[A-Za-z0-9_$]+))?/i.exec(r))) {
-      var t2 = stripQuotes(m[1]), dbw2 = m[2] ? stripQuotes(m[2]) : null;
-      var dbn = dbw2 || this.current;
+      var tTok = splitDbTable(m[1]);
+      var t2 = tTok.table;
+      var dbn = m[2] ? stripQuotes(m[2]) : (tTok.db || this.current);
       // SHOW CREATE TABLE 对视图同样可用（MySQL 会返回视图定义）
       if (!this.tableExists(t2, dbn) && this.viewExists(t2, dbn)) {
         var vdef2 = this.viewDef(t2, dbn);
@@ -2019,7 +3524,7 @@ var MySQLCore = (function () {
       }
       if (!this.tableExists(t2, dbn)) return this.errBlock('ERROR 1146 (42S02): Table \'' + dbn + '.' + t2 + '\' doesn\'t exist');
       var meta = this.meta(t2, dbn);
-      var createSql = meta && meta.raw ? meta.raw : ('CREATE TABLE `' + t2 + '` (' + (meta ? meta.columns.map(function (c) { return '`' + c.field + '` ' + c.type; }).join(', ') : '') + ')');
+      var createSql = showCreateTable(meta, t2);
       var blocks = [this.resultBlock(rs(['Table', 'Create Table'], [[t2, createSql]]), 1, vertical)];
       if (!vertical && createSql.length > 110) {
         blocks.push({ kind: 'note', text: '（提示：建表语句较长，用 SHOW CREATE TABLE ' + t2 + '\\G 可纵向查看，与真实 MySQL 习惯一致）' });
@@ -2027,41 +3532,45 @@ var MySQLCore = (function () {
       return blocks;
     }
     if ((m = /^(?:INDEX|INDEXES|KEYS)\s+(?:FROM|IN)\s+(`[^`]+`|[A-Za-z0-9_$.]+)(?:\s+(?:FROM|IN)\s+(`[^`]+`|[A-Za-z0-9_$]+))?/i.exec(r))) {
-      var t3 = stripQuotes(m[1]), dbw3 = m[2] ? stripQuotes(m[2]) : null;
-      var dbn3 = dbw3 || this.current;
+      var iTok = splitDbTable(m[1]);
+      var t3 = iTok.table;
+      var dbw3 = m[2] ? stripQuotes(m[2]) : null;
+      var dbn3 = dbw3 || iTok.db || this.current;
       if (this.viewExists(t3, dbn3)) return this.errBlock('ERROR 1347 (HY000): \'' + dbn3 + '.' + t3 + '\' is not BASE TABLE');
       var meta3 = this.meta(t3, dbn3);
-      if (!meta3) return this.errBlock('ERROR 1146 (42S02): Table \'' + dbn3 + '.' + t3 + '\' doesn\'t exist');
-      if (!(meta3.indexes || []).length) return this.errBlock('ERROR 1146 (42S02): Table \'' + t3 + '\' doesn\'t exist');
+      if (!meta3 || !this.tableExists(t3, dbn3)) {
+        return this.errBlock('ERROR 1146 (42S02): Table \'' + dbn3 + '.' + t3 + '\' doesn\'t exist');
+      }
+      // 表存在但没有二级索引：MySQL 返回空结果集，而不是"表不存在"
       var ixr = indexesResult(meta3, t3);
       return [this.resultBlock(ixr, ixr.values.length, vertical)];
     }
-    if (/^VARIABLES\b/i.test(r) || /^SESSION\s+VARIABLES\b/i.test(r) || /^GLOBAL\s+VARIABLES\b/i.test(r)) {
-      var likeV = /LIKE\s+'([^']*)'/i.exec(r);
-      var vars = VARIABLES.slice();
-      if (likeV) {
-        var rxV = new RegExp('^' + likeV[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '.*').replace(/_/g, '.') + '$', 'i');
-        vars = vars.filter(function (v) { return rxV.test(v[0]); });
-      }
-      return [this.resultBlock(rs(['Variable_name', 'Value'], vars), vars.length)];
+    if (/^(?:(?:SESSION|GLOBAL|LOCAL)\s+)?VARIABLES\b/i.test(r)) {
+      var varTail = r.replace(/^(?:(?:SESSION|GLOBAL|LOCAL)\s+)?VARIABLES\b/i, '');
+      var fV = filterShowRows(VARIABLES.map(function (v) { return [v[0], v[1]]; }), varTail, ['Variable_name', 'Value']);
+      return [this.resultBlock(rs(['Variable_name', 'Value'], fV.rows), fV.rows.length)];
     }
     if (/^STATUS\b/i.test(r)) {
       var st = [['Aborted_clients', '0'], ['Connections', '1'], ['Questions', String(this.counter)],
         ['Threads_connected', '1'], ['Threads_running', '1'], ['Uptime', String(Math.floor((Date.now() - this.startTime) / 1000))],
         ['Com_select', String(this.counter)], ['Ssl_cipher', '']];
-      return [this.resultBlock(rs(['Variable_name', 'Value'], st), st.length)];
+      var fS = filterShowRows(st, r.replace(/^STATUS\b/i, ''), ['Variable_name', 'Value']);
+      return [this.resultBlock(rs(['Variable_name', 'Value'], fS.rows), fS.rows.length)];
     }
-    if (/^ENGINES\b/i.test(r)) {
+    if ((m = /^ENGINES\b([\s\S]*)$/i.exec(r))) {
       var eng = [
         ['InnoDB', 'DEFAULT', 'Supports transactions, row-level locking, and foreign keys', 'YES', 'YES', 'YES'],
         ['MyISAM', 'YES', 'MyISAM storage engine', 'NO', 'NO', 'NO'],
         ['MEMORY', 'YES', 'Hash based, stored in memory, useful for temporary tables', 'NO', 'NO', 'NO'],
         ['CSV', 'YES', 'CSV storage engine', 'NO', 'NO', 'NO']
       ];
-      return [this.resultBlock(rs(['Engine', 'Support', 'Comment', 'Transactions', 'XA', 'Savepoints'], eng), eng.length)];
+      var fE = filterShowRows(eng, m[1], ['Engine', 'Support', 'Comment', 'Transactions', 'XA', 'Savepoints']);
+      return [this.resultBlock(rs(['Engine', 'Support', 'Comment', 'Transactions', 'XA', 'Savepoints'], fE.rows), fE.rows.length)];
     }
     if (/^WARNINGS\b/i.test(r) || /^ERRORS\b/i.test(r)) {
-      return [this.resultBlock(rs(['Level', 'Code', 'Message'], []), 0)];
+      var wIsErr = /^ERRORS\b/i.test(r);
+      var wRows = (this.warnings || []).filter(function (w) { return wIsErr ? /^Error$/i.test(w[0]) : true; });
+      return [this.resultBlock(rs(['Level', 'Code', 'Message'], wRows), wRows.length)];
     }
     if (/^CHARSET\b/i.test(r)) {
       var cs = [['utf8mb4', 'UTF-8 Unicode', 'utf8mb4_0900_ai_ci', '4'], ['utf8', 'UTF-8 Unicode', 'utf8_general_ci', '3'], ['latin1', 'cp1252 West European', 'latin1_swedish_ci', '1']];
@@ -2123,18 +3632,62 @@ var MySQLCore = (function () {
       return [this.resultBlock(rs(['Database', 'Create Database'],
         [[cdb, 'CREATE DATABASE `' + cdb + '` /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci */ ']]), 1, vertical)];
     }
-    return this.errBlock('ERROR 1064 (42000): You have an error in your SQL syntax; 本模拟器未实现的 SHOW 语句：' + r.split(/\s+/).slice(0, 2).join(' '));
+    // ---- 这些 SHOW 在真实 MySQL 里都是合法语句，只是模拟器里没有对应对象 ----
+    //      旧实现一律报 1064，等于把"本模拟器没实现"伪装成"你的语法写错了"。
+    var emptyShows = [
+      [/^TRIGGERS\b/i, ['Trigger', 'Event', 'Table', 'Statement', 'Timing', 'Created', 'sql_mode', 'Definer', 'character_set_client', 'collation_connection', 'Database Collation']],
+      [/^EVENTS\b/i, ['Db', 'Name', 'Definer', 'Time zone', 'Type', 'Execute at', 'Interval value', 'Interval field', 'Starts', 'Ends', 'Status', 'Originator', 'character_set_client', 'collation_connection', 'Database Collation']],
+      [/^(?:PROCEDURE|FUNCTION)\s+STATUS\b/i, ['Db', 'Name', 'Type', 'Definer', 'Modified', 'Created', 'Security_type', 'Comment', 'character_set_client', 'collation_connection', 'Database Collation']],
+      [/^OPEN\s+TABLES\b/i, ['Database', 'Table', 'In_use', 'Name_locked']],
+      [/^(?:BINARY|BINLOG)\s+LOG(?:S|S\s+STATUS)\b/i, ['Log_name', 'File_size', 'Encrypted']],
+      [/^(?:REPLICA|SLAVE|MASTER)\s+STATUS\b/i, ['File', 'Position', 'Binlog_Do_DB', 'Binlog_Ignore_DB', 'Executed_Gtid_Set']],
+      [/^PROFILES\b/i, ['Query_ID', 'Duration', 'Query']],
+      [/^PLUGINS\b/i, ['Name', 'Status', 'Type', 'Library', 'License']],
+      [/^RELAYLOG\s+EVENTS\b/i, ['Log_name', 'Pos', 'Event_type', 'Server_id', 'End_log_pos', 'Info']]
+    ];
+    for (var si = 0; si < emptyShows.length; si++) {
+      if (!emptyShows[si][0].test(r)) continue;
+      return [this.resultBlock(rs(emptyShows[si][1], []), 0, vertical),
+        { kind: 'note', text: '（提示：模拟器里没有真正的 ' + r.split(/\s+/)[0].toUpperCase() +
+          ' 对象，所以返回空结果集 —— 这条语句被正确识别了，不是语法错误。）' }];
+    }
+    if (/^COUNT\s*\(\s*\*\s*\)\s+(WARNINGS|ERRORS)\b/i.test(r)) {
+      var cwIsErr = /ERRORS/i.test(r);
+      var cwName = cwIsErr ? '@@session.error_count' : '@@session.warning_count';
+      return [this.resultBlock(rs([cwName], [[String(cwIsErr ? 0 : (this.warnings || []).length)]]), 1, vertical)];
+    }
+    if ((m = /^ENGINE\s+(\w+)\s+(STATUS|MUTEX)\b/i.exec(r))) {
+      return [this.resultBlock(rs(['Type', 'Name', 'Status'],
+        [[m[1], '', '本模拟器未实现 SHOW ENGINE ' + m[1].toUpperCase() + ' ' + m[2].toUpperCase() +
+          ' —— 存储引擎的运行时状态属于真实 InnoDB 的内部信息，模拟器没有对应数据可报告。']]), 1, vertical),
+        { kind: 'note', text: '（提示：本模拟器底层是 SQLite，SHOW ENGINES 里的 InnoDB 是静态展示，因此没有引擎运行时状态。）' }];
+    }
+    if ((m = /^(?:FULL\s+)?PROCESSLIST\b/i.exec(r))) {
+      var pl = [[String(CONNECTION_ID), 'root', 'localhost', this.current || '', 'Query', '0', 'SHOW PROCESSLIST', '']];
+      return [this.resultBlock(rs(['Id', 'User', 'Host', 'db', 'Command', 'Time', 'State', 'Info'], pl), pl.length, vertical)];
+    }
+    // ---- 仍未实现的 SHOW：语句本身在真实 MySQL 里存在，因此不能说成 1064 语法错误 ----
+    return this.errBlock('ERROR 1235 (42000): 本模拟器暂不支持 SHOW ' + r.split(/\s+/).slice(0, 2).join(' ') +
+      ' —— 该语句在真实 MySQL 中存在，但本模拟器没有实现');
   };
 
-  Engine.prototype.describeTable = function (table, dbName) {
+  Engine.prototype.describeTable = function (table, dbName, likePattern, full) {
     var dbn = dbName || this.current;
+    if (dbName && !this.databases[dbn]) {
+      return this.errBlock('ERROR 1049 (42000): Unknown database \'' + dbn + '\'');
+    }
     var isView = this.viewExists(table, dbn);
     if (!this.tableExists(table, dbn) && !isView) {
       return this.errBlock('ERROR 1146 (42S02): Table \'' + dbn + '.' + table + '\' doesn\'t exist');
     }
     var meta = this.meta(table, dbn);
     if (!meta) return this.errBlock('ERROR 1146 (42S02): Table \'' + dbn + '.' + table + '\' doesn\'t exist');
-    var r = describeResult(meta, table);
+    var r = describeResult(meta, table, full);
+    // SHOW COLUMNS ... LIKE 'x' / DESC tbl col：按列名过滤（MySQL 里 DESC tbl col 等价于 LIKE 'col'）
+    if (likePattern) {
+      var rx = likeRegex(likePattern);
+      r = rs(r.columns, r.values.filter(function (row) { return rx.test(String(row[0])); }));
+    }
     var blocks = [this.resultBlock(r, r.values.length)];
     if (isView) {
       blocks.push({ kind: 'note', text: '（' + table + ' 是视图，不是基表：列类型由底层声明推导，计算列可能显示为 varchar(255)。用 SHOW CREATE VIEW ' + table + ' 可看视图定义。）' });
@@ -2148,6 +3701,66 @@ var MySQLCore = (function () {
   };
 
   Engine.prototype.errBlock = function (text) { return [{ kind: 'err', text: text }]; };
+
+  /** 记一条会话警告（SHOW WARNINGS 用） */
+  Engine.prototype.addWarning = function (level, code, message) {
+    if (!this.warnings) this.warnings = [];
+    this.warnings.push([level, String(code), message]);
+    if (this.warnings.length > 64) this.warnings.shift();
+  };
+
+  /**
+   * 把某个库导出成可重放的 SQL 脚本（建表语句 + 数据 INSERT + 视图定义）。
+   * 供界面「导出 SQL 脚本」使用；全程在本地生成 Blob，不联网、不上传。
+   */
+  Engine.prototype.dumpDatabase = function (dbName) {
+    var name = dbName || this.current;
+    var entry = this.databases[name];
+    if (!entry) return null;
+    var self = this;
+    var out = [];
+    out.push('-- MySQL 终端模拟器 · 数据库导出脚本');
+    out.push('-- 数据库：' + name + '　导出时间：' + fmtLocalDT(new Date()));
+    out.push('-- 用「工具」面板里的「导入 SQL 脚本」选中本文件即可重放。');
+    out.push('');
+    out.push('CREATE DATABASE IF NOT EXISTS `' + name + '`;');
+    out.push('USE `' + name + '`;');
+    out.push('');
+    this.objectList(name).forEach(function (o) {
+      if (o.isView) {
+        var vd = self.viewDef(o.name, name);
+        out.push('DROP VIEW IF EXISTS `' + o.name + '`;');
+        if (vd && vd.createSql) out.push(vd.createSql + ';');
+        out.push('');
+        return;
+      }
+      var meta = self.meta(o.name, name);
+      out.push('DROP TABLE IF EXISTS `' + o.name + '`;');
+      out.push(showCreateTable(meta, o.name) + ';');
+      try {
+        var r = entry.db.exec('SELECT * FROM `' + String(o.name).replace(/`/g, '``') + '`');
+        if (r.length && r[0].values.length) {
+          var cols = r[0].columns;
+          var rows = r[0].values.map(function (row) {
+            return '(' + row.map(function (v) {
+              if (v === null || v === undefined) return 'NULL';
+              if (typeof v === 'number') return String(v);
+              if (v instanceof Uint8Array) {
+                return "X'" + Array.prototype.map.call(v, function (b) { return b2h(b); }).join('') + "'";
+              }
+              return "'" + String(v).replace(/\\/g, '\\\\').replace(/'/g, "''") + "'";
+            }).join(', ') + ')';
+          });
+          out.push('INSERT INTO `' + o.name + '` (' + cols.map(function (c) { return '`' + c + '`'; }).join(', ') + ') VALUES');
+          out.push(rows.join(',\n') + ';');
+        }
+      } catch (e) {
+        out.push('-- （' + o.name + ' 的数据导出失败：' + (e && e.message ? e.message : e) + '）');
+      }
+      out.push('');
+    });
+    return out.join('\n');
+  };
 
   Engine.prototype.statusText = function () {
     var up = Math.floor((Date.now() - this.startTime) / 1000);
@@ -2204,11 +3817,16 @@ var MySQLCore = (function () {
     '  变量与状态     SHOW VARIABLES LIKE \'version\';  SHOW STATUS;  SHOW ENGINES;  status;',
     '  事务与变量     START TRANSACTION; / BEGIN;   COMMIT;   ROLLBACK;   SAVEPOINT 名称;',
     '                 SET @x = 1;   SELECT @x;   SELECT @@version, @@port;   SET NAMES utf8mb4;',
-    '  索引维护       ALTER TABLE 表 ADD [UNIQUE] INDEX 名 (列);  DROP INDEX 名 ON 表;  EXPLAIN SELECT ...;',
+    '  索引维护       ALTER TABLE 表 ADD [UNIQUE] INDEX 名 (列);  DROP INDEX 名 ON 表;',
+    '  执行计划       EXPLAIN SELECT ...;   EXPLAIN FORMAT=JSON SELECT ...;   EXPLAIN ANALYZE SELECT ...;',
+    '  变量赋值       SET @x = 1;   SELECT @x;   SELECT 列 INTO @x FROM 表 WHERE ...;',
     '  客户端命令     help / \\h      显示本帮助',
     '                 status / \\s    查看连接与服务器状态',
     '                 clear          清屏（等同 Ctrl+L）：只清空可视区域，向上滚动仍可回看历史',
     '                 exit / quit     退出（等同 Ctrl+D）',
+    '  导出与导入     右侧「工具」面板：把上一个查询结果导出成 CSV / JSON，',
+    '                 把当前库导出成 .sql 脚本，或选择本地 .sql 文件导入执行。',
+    '                 全部在本地完成，不联网、不上传。',
     '  书写技巧       语句以 ; 或 \\g 结束；以 \\G 结束则纵向显示结果',
     '                 输入未结束时提示符变为 ->，可继续换行书写',
     '                 Tab 补全 SQL 关键字与表名；↑ ↓ 翻阅历史命令',
@@ -2391,7 +4009,29 @@ var MySQLCore = (function () {
     { level: 3, title: '日期格式化', prompt: "把注册时间格式化成「2026年03月12日」的样子，显示用户名和格式化后的日期（列名 d）。", answer: "SELECT username, DATE_FORMAT(created_at, '%Y年%m月%d日') AS d FROM users LIMIT 5;", hint: 'DATE_FORMAT(列, 格式串)' },
     { level: 3, title: '自己建表', prompt: '建一张 MySQL 风格的表 books：id 自增主键、title 不能为空、author、price 小数、published_at 日期时间默认当前时间。', answer: "CREATE TABLE books (\n  id int(11) NOT NULL AUTO_INCREMENT,\n  title varchar(100) NOT NULL,\n  author varchar(50) DEFAULT NULL,\n  price decimal(8,2) DEFAULT NULL,\n  published_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,\n  PRIMARY KEY (id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;", hint: 'AUTO_INCREMENT / ENGINE=InnoDB 都会被自动转译' },
     { level: 3, title: '纵向看一行', prompt: '用 \\G 纵向显示 users 表中 id 为 1 的那条记录。', answer: 'SELECT * FROM users WHERE id = 1\\G', hint: '结尾写 \\G 而不是 ;' },
-    { level: 3, title: '制造一个错误', prompt: "故意查询一张不存在的表 t_nothing，观察 MySQL 风格的报错信息（ERROR 1146）。", answer: 'SELECT * FROM t_nothing;', hint: '看看报错码是不是 1146', expectError: true }
+    { level: 3, title: '制造一个错误', prompt: "故意查询一张不存在的表 t_nothing，观察 MySQL 风格的报错信息（ERROR 1146）。", answer: 'SELECT * FROM t_nothing;', hint: '看看报错码是不是 1146', expectError: true },
+    { level: 3, title: '子查询配 IN', prompt: '用 IN 子查询找出下过订单的用户名。', answer: 'SELECT username FROM users WHERE id IN (SELECT user_id FROM orders);', hint: 'WHERE 列 IN (SELECT ...)' },
+    { level: 3, title: '区间筛选', prompt: '找出余额在 1000 到 10000 之间的用户名。', answer: 'SELECT username FROM users WHERE balance BETWEEN 1000 AND 10000;', hint: 'BETWEEN ... AND ...' },
+    { level: 3, title: '多列排序', prompt: '按城市升序、余额降序列出用户名、城市和余额。', answer: 'SELECT username, city, balance FROM users ORDER BY city ASC, balance DESC;', hint: 'ORDER BY 可以跟多个列' },
+    { level: 3, title: '分组后再筛', prompt: '找出用户数不少于 2 的城市及人数（列名 cnt）。', answer: 'SELECT city, COUNT(*) AS cnt FROM users GROUP BY city HAVING cnt >= 2;', hint: 'GROUP BY 之后用 HAVING' },
+    { level: 3, title: 'CTE 公共表表达式', prompt: '用 WITH 先取出价格大于 1000 的商品，再统计它们的数量（列名 n）。', answer: 'WITH big AS (SELECT * FROM products WHERE price > 1000) SELECT COUNT(*) AS n FROM big;', hint: 'WITH 名字 AS (SELECT ...)' },
+    { level: 3, title: '窗口累计求和', prompt: '按 id 顺序给出每个用户的余额累计和，列名 running。', answer: 'SELECT username, SUM(balance) OVER (ORDER BY id) AS running FROM users;', hint: 'SUM(...) OVER (ORDER BY ...)' },
+    { level: 3, title: '分组内排名', prompt: '在每个城市内部按余额降序用 ROW_NUMBER() 编号，显示用户名、城市、编号 rn。', answer: 'SELECT username, city, ROW_NUMBER() OVER (PARTITION BY city ORDER BY balance DESC) AS rn FROM users;', hint: 'OVER (PARTITION BY ... ORDER BY ...)' },
+    { level: 3, title: '看上一行的值', prompt: '用 LAG 取出每个用户按 id 排序时上一行的余额，列名 prev。', answer: 'SELECT username, LAG(balance) OVER (ORDER BY id) AS prev FROM users;', hint: 'LAG(列) OVER (ORDER BY ...)' },
+    { level: 3, title: '自己跟自己连表', prompt: '找出同城用户的成对组合（同一城市、前者 id 更小），显示两边的用户名。', answer: 'SELECT a.username, b.username FROM users a JOIN users b ON a.city = b.city AND a.id < b.id;', hint: '同一张表起两个别名' },
+    { level: 4, title: '建一个视图', prompt: '创建一个名为 v_vip 的视图，包含 vip_level 不小于 2 的用户的用户名与余额。', answer: 'CREATE VIEW v_vip AS SELECT username, balance FROM users WHERE vip_level >= 2;', hint: 'CREATE VIEW 名字 AS SELECT ...' },
+    { level: 4, title: '换掉视图定义', prompt: '把视图 v_vip 改成只包含余额大于 10000 的用户（用户名与余额两列）。', answer: 'CREATE OR REPLACE VIEW v_vip AS SELECT username, balance FROM users WHERE balance > 10000;', hint: 'CREATE OR REPLACE VIEW' },
+    { level: 4, title: '派生表做聚合', prompt: '先用派生表取出 vip_level 不小于 2 的用户，再统计人数（列名 n）。', answer: 'SELECT COUNT(*) AS n FROM (SELECT id FROM users WHERE vip_level >= 2) AS vip;', hint: 'FROM (SELECT ...) AS 别名' },
+    { level: 4, title: '建联合索引', prompt: '在 users 表上建一个名为 idx_vip_balance 的联合索引，列为 vip_level 和 balance。', answer: 'CREATE INDEX idx_vip_balance ON users (vip_level, balance);', hint: 'CREATE INDEX 名 ON 表 (列, 列)' },
+    { level: 4, title: '用上索引看看', prompt: '对 SELECT * FROM users WHERE city = \'深圳\' 做一次 EXPLAIN，观察执行计划。', answer: "EXPLAIN SELECT * FROM users WHERE city = '深圳';", hint: 'EXPLAIN 加在 SELECT 前面' },
+    { level: 4, title: '设一个保存点', prompt: '在当前事务里建立一个名为 sp_demo 的保存点。', answer: 'SAVEPOINT sp_demo;', hint: 'SAVEPOINT 名字' },
+    { level: 4, title: '条件聚合', prompt: '按城市统计 vip_level 不小于 2 的人数，列名 vip_cnt。', answer: 'SELECT city, SUM(CASE WHEN vip_level >= 2 THEN 1 ELSE 0 END) AS vip_cnt FROM users GROUP BY city;', hint: 'SUM(CASE WHEN ... THEN 1 ELSE 0 END)' },
+    { level: 4, title: '按状态汇总订单', prompt: '按订单状态统计订单数和总金额（列名 cnt、amt），按总金额降序。', answer: 'SELECT status, COUNT(*) AS cnt, SUM(total) AS amt FROM orders GROUP BY status ORDER BY amt DESC;', hint: 'GROUP BY 状态 + COUNT/SUM' },
+    { level: 4, title: '算一个小数', prompt: '把每个用户的余额除以 100 并按两位小数显示，列名 pct，取前 3 名（按 pct 降序）。', answer: 'SELECT username, ROUND(balance / 100, 2) AS pct FROM users ORDER BY pct DESC LIMIT 3;', hint: 'ROUND(表达式, 2)' },
+    { level: 4, title: '递归数数', prompt: '用递归 CTE 生成 1 到 10，并求它们的和（列名 total）。', answer: 'WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 10) SELECT SUM(n) AS total FROM seq;', hint: 'WITH RECURSIVE 名字(列) AS (...)' },
+    { level: 4, title: '商品分类排行', prompt: '统计每个分类中价格最高的商品价格（列名 mx），只保留 mx 大于 1000 的分类，按 mx 降序。', answer: 'SELECT category, MAX(price) AS mx FROM products GROUP BY category HAVING mx > 1000 ORDER BY mx DESC;', hint: 'MAX + HAVING + ORDER BY' },
+    { level: 4, title: '日期往后推', prompt: '把每个用户的注册时间往后推 30 天，列出用户名和结果（列名 d30），只看前 3 行。', answer: 'SELECT username, DATE_ADD(created_at, INTERVAL 30 DAY) AS d30 FROM users LIMIT 3;', hint: 'DATE_ADD(列, INTERVAL 30 DAY)' },
+    { level: 4, title: '造一段 JSON', prompt: '把商品名和价格组成 JSON 对象，列名 j，只看前 3 行。', answer: "SELECT JSON_OBJECT('name', name, 'price', price) AS j FROM products LIMIT 3;", hint: 'JSON_OBJECT(键, 值, ...)' }
   ];
 
   /* ======================= 12. 与真实 MySQL 的差异（诚实清单） ======================= */
@@ -2399,27 +4039,38 @@ var MySQLCore = (function () {
   var DIFFERENCES = [
     { group: '数据与显示', items: [
       'DECIMAL 不补尾随零：底层按数值存储，12800.50 会显示为 12800.5。计算类函数（ROUND/AVG）行为一致。',
-      '不写 ORDER BY 时不保证行序：底层可能走覆盖索引（例如只查询加了唯一约束的列），结果可能按索引顺序而非插入顺序返回。真实 MySQL 也只是"通常"按主键顺序返回，显式写 ORDER BY 才是可靠做法。',
+      '除法结果不补小数位：`7/2` 的**值**与 MySQL 一致（3.5），但真实 MySQL 的 `/` 返回 DECIMAL，会显示成 3.5000；模拟器按数值显示。',
+      '不写 ORDER BY 时不保证行序：底层可能走覆盖索引，结果可能按索引顺序而非插入顺序返回。显式写 ORDER BY 才是可靠做法。',
       '数据仅存于浏览器内存，刷新页面即恢复初始示例数据，不做任何持久化。',
-      '字符集与排序规则（utf8mb4_0900_ai_ci 等）只作展示；实际字符串比较遵循底层规则，默认区分大小写，而 MySQL 默认排序规则不区分大小写。'
+      '字符集与排序规则（utf8mb4_0900_ai_ci 等）只作展示；实际字符串比较遵循底层规则，默认区分大小写（WHERE username = \'ABC\' 匹配不到 \'abc\'），而 MySQL 默认排序规则不区分大小写。',
+      '类型比较不完全按 MySQL 的隐式转换：SELECT 5 = \'5\' 得到 0，真实 MySQL 得到 1（有一方是列时会按列类型转换，行为一致）。建议显式写 CAST。'
     ] },
     { group: 'SQL 语法', items: [
-      '已自动转译：AUTO_INCREMENT、ENGINE=/DEFAULT CHARSET=/COLLATE=/COMMENT=、ENUM/SET/JSON 类型、UNSIGNED/ZEROFILL、反引号、SHOW/DESC/DESCRIBE、GROUP_CONCAT ... SEPARATOR、"LIMIT a, b" 写法、CONCAT/IF/IFNULL/NOW/DATE_FORMAT 等函数、TRUNCATE TABLE、INSERT IGNORE、INSERT ... ON DUPLICATE KEY UPDATE、RENAME TABLE、START TRANSACTION / BEGIN / COMMIT / ROLLBACK / SAVEPOINT、ALTER TABLE 的 ADD|DROP|MODIFY|CHANGE|RENAME COLUMN 与 ADD|DROP INDEX|KEY、CREATE TABLE ... LIKE、DROP TABLE 多表、DROP INDEX ... ON、EXPLAIN、UPDATE/DELETE ... LIMIT、FIELD()、RLIKE、SET（变量）。',
-      '变量：支持用户变量 SET @x = 1 / SELECT @x（未赋值时返回 NULL，与 MySQL 一致）以及 @ 号前的系统变量查询（@@version、@@autocommit 等）；未知系统变量报 1193。SET GLOBAL 会被接受但只作用于当前会话。',
+      '已自动转译：AUTO_INCREMENT（含 AUTO_INCREMENT=N 起始值）、ENGINE=/DEFAULT CHARSET=/COLLATE=/COMMENT=、ENUM/SET/JSON 类型、UNSIGNED/ZEROFILL、反引号、SHOW/DESC/DESCRIBE、GROUP_CONCAT ... SEPARATOR（含 DISTINCT / ORDER BY 组合）、"LIMIT a, b"、CONCAT/IF/IFNULL/NOW/DATE_FORMAT 等函数、TRUNCATE TABLE、INSERT IGNORE、INSERT ... ON DUPLICATE KEY UPDATE、REPLACE INTO、INSERT ... SET、SELECT ... INTO @变量、RENAME TABLE、START TRANSACTION / BEGIN / COMMIT / ROLLBACK / SAVEPOINT、ALTER TABLE 的 ADD|DROP|MODIFY|CHANGE|RENAME COLUMN 与 ADD|DROP INDEX|KEY、CREATE TABLE ... LIKE / ... AS SELECT、DROP TABLE 多表、DROP INDEX ... ON、UPDATE/DELETE ... LIMIT、FIELD()、RLIKE、a DIV b、a <=> b、CONVERT(expr, type)、TRIM(... FROM ...)、POSITION(x IN y)、ISNULL(x)、EXTRACT(unit FROM x)、DATE_ADD/DATE_SUB/ADDDATE/SUBDATE(..., INTERVAL n unit)、TIMESTAMPDIFF / TIMESTAMPADD、INSERT() 字符串函数、SET（变量）。',
+      '变量：支持用户变量 SET @x = 1 / SELECT @x（未赋值时返回 NULL，与 MySQL 一致）以及系统变量查询（@@version、@@autocommit 等）；未知系统变量报 1193。SELECT ... INTO @x 已支持（只取第一行，取不到行时报 1329）。SET GLOBAL 会被接受但只作用于当前会话。',
       '视图：CREATE VIEW / CREATE OR REPLACE VIEW / ALTER VIEW / DROP VIEW 均可用，SHOW TABLES、SHOW FULL TABLES、DESC、SHOW CREATE VIEW、SHOW CREATE TABLE 都能正确识别视图。',
-      '未支持：存储过程、触发器、事件、ON DUPLICATE KEY UPDATE、INTERVAL 日期运算、分区表、全文检索 MATCH ... AGAINST、用户与权限管理（GRANT/REVOKE/CREATE USER）、复制与日志；备份类语句（BACKUP/RESTORE）在 MySQL 社区版里本身就不存在（那是企业版组件或 mysqldump 工具的职责）。',
+      '日期函数按 MySQL 语义实现：DATE_ADD(\'2026-01-31\', INTERVAL 1 MONTH) 得 2026-02-28（向月末收敛），而不是底层 +1 month 的 3 月 3 日。但 INTERVAL 的复合单位（HOUR_MINUTE、YEAR_MONTH 等）未实现，WEEK() 的 mode 参数只实现了 0 与 3。',
+      '哈希与字符串函数：MD5 / SHA1 / SHA2(x, 224|256) 已实现（标准测试向量已回归）；SHA2 的 384 / 512 位未实现，返回 NULL 而不是编一个假摘要。STR_TO_DATE 只支持 %Y %y %m %c %d %e %H %k %h %I %i %s %S 这些常见占位符。',
       '"||" 语义不同：MySQL 默认把它当逻辑 OR，此处底层把它当字符串连接。建议统一用 OR / CONCAT()。',
-      '函数差异：CONCAT() 的 NULL 处理与 MySQL 不同——MySQL 只要有一个参数为 NULL 就返回 NULL，这里的底层实现会跳过 NULL 继续拼接（CONCAT_WS 的"跳过 NULL"语义与 MySQL 一致）。FIELD() 已在转译阶段展开为等价的 CASE 表达式，行为与 MySQL 相同。',
-      '双引号：这里的 "abc" 与 MySQL 默认 sql_mode 一样被当作字符串。若你在真实环境开启了 ANSI_QUOTES，双引号含义会变成标识符。'
+      'CONCAT() 已按 MySQL 语义实现（任一参数为 NULL 则整体返回 NULL）；CONCAT_WS 的"跳过 NULL"与 MySQL 一致。FIELD() 在转译阶段展开为等价的 CASE 表达式，行为与 MySQL 相同。',
+      '双引号：这里的 "abc" 与 MySQL 默认 sql_mode 一样被当作字符串。若你在真实环境开启了 ANSI_QUOTES，双引号含义会变成标识符。',
+      '未支持：存储过程、触发器、事件（报 1235）、PREPARE / EXECUTE、INTERVAL 复合单位、分区表、FULLTEXT / SPATIAL 索引与全文检索 MATCH ... AGAINST、用户与权限管理（GRANT/REVOKE/CREATE USER）、复制与二进制日志、XA、HANDLER、IMPORT TABLE / CLONE；备份类语句（BACKUP/RESTORE）在 MySQL 社区版里本身就不存在（那是企业版组件或 mysqldump 工具的职责）。',
+      'BENCHMARK() 与 SLEEP() 只返回 MySQL 的返回值（都是 0），不会真的计时或阻塞——在浏览器里阻塞界面是不可接受的。GET_LOCK / RELEASE_LOCK 在单连接下恒为成功。'
     ] },
     { group: '存储与执行', items: [
-      '索引：DESC / SHOW INDEX 展示的是建表语句中声明的索引（元数据真实），但底层只保留唯一约束、不额外创建二级索引，因此查询执行计划与真实 MySQL 不同。',
-      '事务：START TRANSACTION / BEGIN / COMMIT / ROLLBACK / SAVEPOINT / ROLLBACK TO 都可用，并且回滚是真实生效的——插入后 ROLLBACK，数据真的会消失。但没有 MySQL 的隔离级别、行级锁与 MVCC：并发场景不可模拟，SET TRANSACTION ISOLATION LEVEL 只被接受、不产生任何效果；SHOW ENGINES 里的 InnoDB 信息为静态展示。',
+      '索引：DESC / SHOW INDEX 展示的是建表语句中声明的索引（元数据真实），但底层只保留唯一约束、不额外创建二级索引。因此 EXPLAIN 里会同时出现「possible_keys 列出了索引」和「type=ALL 没走索引」——这正是底层确实没有该索引的真实反映，不是显示错误。',
+      'EXPLAIN 的输出形态按 MySQL 的 12 列组织（也支持 FORMAT=JSON / TREE / ANALYZE），但数据来源是底层引擎的查询计划，而不是 InnoDB 优化器的成本估算，因此 type / rows 等字段只作示意。',
+      '外键：建表时声明的 FOREIGN KEY 会真实生效——插入不存在的父行报 1452，删除被引用的父行报 1451。',
+      '事务：START TRANSACTION / BEGIN / COMMIT / ROLLBACK / SAVEPOINT / ROLLBACK TO 都可用，并且回滚是真实生效的——插入后 ROLLBACK，数据真的会消失。但没有 MySQL 的隔离级别、行级锁与 MVCC：并发场景不可模拟，FOR UPDATE / LOCK IN SHARE MODE 会被忽略并给出提示，SET TRANSACTION ISOLATION LEVEL 只被接受、不产生任何效果。',
       '视图：底层是真实视图，可查询、可与其他表 JOIN、可再被其他视图引用。但真实 MySQL 允许对「简单可更新视图」（单表、不含聚合/去重/子查询）直接 INSERT/UPDATE/DELETE 并写回基表，本模拟器一律报 ERROR 1288，不支持透过视图写数据。',
-      '视图列信息：DESC 视图时，列类型由底层声明推导（如 varchar(50)、decimal(10,2) 能原样带出）；计算列（如 id*2、UPPER(name)）拿不到声明类型时统一显示 varchar(255)，且 Nullable 一律显示 YES。',
-      '视图定义：SHOW CREATE VIEW 的输出按 MySQL 习惯格式（含 ALGORITHM / DEFINER / SQL SECURITY）重新排版，与实际存储的定义文字不逐字相同。',
-      '系统库：information_schema、performance_schema、sys 仅有库名占位、没有数据字典内容（mysql 库中的 user 表可正常查询）。',
-      'AUTO_INCREMENT：通过 INTEGER PRIMARY KEY 实现，能正确自增；但不支持指定起始值/步长，且 TRUNCATE（转译为 DELETE）不会重置计数器。',
+      '视图列信息：DESC 视图时，列类型由底层声明推导（如 varchar(50)、decimal(10,2) 能原样带出）；计算列（如 id*2、UPPER(name)）拿不到声明类型时统一显示 varchar(255)，且 Nullable 一律显示 YES。SHOW CREATE VIEW 的输出按 MySQL 习惯格式（含 ALGORITHM / DEFINER / SQL SECURITY）重新排版，与实际存储的定义文字不逐字相同。',
+      'CREATE TABLE ... AS SELECT：列类型会从源查询推导（能对上源表列的用源列声明类型，计算列按表达式推断），但不会复制索引与约束。',
+      'SHOW CREATE TABLE：示例数据的建表原文原样回显；用户自己建的表会按目录重新生成 MySQL 风格 DDL（带 ENGINE=InnoDB DEFAULT CHARSET=utf8mb4），而不是把底层 SQLite 的措辞倒出来。',
+      '系统库：information_schema、performance_schema、sys 仅有库名占位、没有数据字典内容（mysql 库中的 user 表可正常查询，但要先 USE mysql）。',
+      '跨库限定名 db.table 暂不支持：每个库在底层是各自独立的连接，所以 SELECT ... FROM mysql.user 这类写法会报 1146，请先 USE 到目标库再写裸表名。这是已知的架构级限制。',
+      'TEMPORARY TABLE 会真实创建，且 SHOW TABLES / DESC / 侧栏都能看到它（与真实会话内的行为一致）；重连后消失。',
+      'SHOW 系列里与"本模拟器没有建模的对象"相关的语句（SHOW TRIGGERS / EVENTS / PROCEDURE STATUS / OPEN TABLES / BINARY LOGS / REPLICA STATUS / PLUGINS 等）返回空结果集；SHOW ENGINE INNODB STATUS 会明确说明未实现，而不是伪装成语法错误。',
+      'AUTO_INCREMENT：支持列自增，也支持 CREATE TABLE ... AUTO_INCREMENT=N 与 ALTER TABLE ... AUTO_INCREMENT=N 指定起始值（对 INSERT ... VALUES 生效），TRUNCATE 会把计数器重置回 1；但不支持步长（auto_increment_increment）与 INSERT ... SELECT 形式的自动编号。',
       '权限：所有语句都以 root@localhost 身份执行，不做权限校验与访问控制。',
       '时间：NOW()/CURDATE() 取本机本地时间；真实 MySQL 的行为取决于服务器时区与 time_zone 设置。'
     ] }

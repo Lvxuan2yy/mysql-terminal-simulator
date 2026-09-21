@@ -180,17 +180,109 @@
 
   function refreshPrompt() { el.prompt.textContent = currentPrompt(); }
 
+  /* 输入行语法高亮：只影响显示，真正的输入与光标位置仍然由隐藏的 <input> 决定 */
+  var HL_WORDS = null;
+  function hlWords() {
+    if (!HL_WORDS) {
+      HL_WORDS = {};
+      KEYWORDS.forEach(function (k) { HL_WORDS[k.toLowerCase()] = 1; });
+    }
+    return HL_WORDS;
+  }
+
+  function hlSpan(cls, text) {
+    var sp = document.createElement('span');
+    sp.className = cls;
+    sp.textContent = text;
+    return sp;
+  }
+
+  /** 把一段 SQL 按词法切成 span 追加到容器里（关键字 / 字符串 / 数字 / 行注释上色） */
+  function appendHighlighted(container, text) {
+    var s = String(text), i = 0, buf = '', kw = hlWords();
+    function flush() {
+      if (!buf) return;
+      container.appendChild(document.createTextNode(buf));
+      buf = '';
+    }
+    while (i < s.length) {
+      var ch = s.charAt(i), nx = s.charAt(i + 1);
+      if (ch === "'" || ch === '"') {                       // 字符串字面量
+        flush();
+        var j = i + 1;
+        while (j < s.length) {
+          if (s.charAt(j) === '\\') { j += 2; continue; }
+          if (s.charAt(j) === ch) { j++; break; }
+          j++;
+        }
+        container.appendChild(hlSpan('s', s.slice(i, j)));
+        i = j;
+        continue;
+      }
+      if ((ch === '-' && nx === '-') || ch === '#') {        // 行注释：后面全部按注释上色
+        flush();
+        container.appendChild(hlSpan('cm', s.slice(i)));
+        i = s.length;
+        continue;
+      }
+      if (/[0-9]/.test(ch) && !/[A-Za-z0-9_$]/.test(s.charAt(i - 1))) {
+        var numM = /^[0-9]+(?:\.[0-9]+)?/.exec(s.slice(i));
+        flush();
+        container.appendChild(hlSpan('num', numM[0]));
+        i += numM[0].length;
+        continue;
+      }
+      if (/[A-Za-z_]/.test(ch)) {
+        var w = /^[A-Za-z_][A-Za-z0-9_]*/.exec(s.slice(i))[0];
+        flush();
+        if (kw[w.toLowerCase()]) container.appendChild(hlSpan('k', w));
+        else container.appendChild(document.createTextNode(w));
+        i += w.length;
+        continue;
+      }
+      buf += ch;
+      i++;
+    }
+    flush();
+  }
+
   function renderInput() {
     var v = el.hidden.value;
     var pos = (el.hidden.selectionStart === null || el.hidden.selectionStart === undefined)
       ? v.length : el.hidden.selectionStart;
     el.input.textContent = '';
-    el.input.appendChild(document.createTextNode(v.slice(0, pos)));
-    var c = document.createElement('span');
-    c.className = 'caret';
-    c.textContent = 'x';
-    el.input.appendChild(c);
-    el.input.appendChild(document.createTextNode(v.slice(pos)));
+    appendHighlighted(el.input, v);
+    // 把光标插到 pos 处（必要时把文本节点/关键字 span 切开，保证位置精确）
+    var caret = document.createElement('span');
+    caret.className = 'caret';
+    caret.textContent = 'x';
+    var remaining = pos, node = el.input.firstChild, placed = false;
+    while (node) {
+      var next = node.nextSibling;
+      var len = (node.nodeType === 3 ? node.nodeValue : node.textContent).length;
+      if (remaining <= len) {
+        if (node.nodeType === 3) {
+          var after = node.splitText(remaining);
+          el.input.insertBefore(caret, after);
+        } else {
+          var full = node.textContent;
+          if (remaining >= full.length) {
+            // 光标正好在这个 span 的末尾：直接插在它后面，别切出一个空 span
+            el.input.insertBefore(caret, next);
+          } else {
+            node.textContent = full.slice(0, remaining);
+            var rest = hlSpan(node.className, full.slice(remaining));
+            el.input.insertBefore(rest, next);
+            el.input.insertBefore(caret, rest);
+          }
+        }
+        placed = true;
+        break;
+      }
+      remaining -= len;
+      node = next;
+    }
+    if (!placed) el.input.appendChild(caret);
   }
 
   function setInput(v) {
@@ -463,7 +555,14 @@
   function renderExercises() {
     var box = el.ex;
     box.innerHTML = '';
-    var lvNames = { 1: '基础', 2: '进阶', 3: '挑战' };
+    var lvNames = { 1: '基础', 2: '进阶', 3: '挑战', 4: '实战' };
+    if (el.exNote) {
+      var names = Object.keys(lvNames).map(function (k) { return lvNames[k]; });
+      var CN = ['', '一', '二', '三', '四', '五', '六'];
+      el.exNote.textContent = '共 ' + Core.EXERCISES.length + ' 道练习，分 ' + names.join(' / ') + ' ' +
+        (CN[names.length] || names.length) + '档。点「答案」可查看参考答案；当你的写法和参考答案一致' +
+        '（忽略大小写、多余空格、反引号与单字母表别名）时本道题会自动打勾。进度存在浏览器本地。';
+    }
     var lastLv = 0;
     Core.EXERCISES.forEach(function (ex, i) {
       if (ex.level !== lastLv) {
@@ -578,6 +677,129 @@
     el.help.textContent = Core.HELP_TEXT;
   }
 
+  /* ---------------- 工具：导出结果 / 导出脚本 / 导入脚本 ----------------
+     全部在浏览器本地完成（Blob + FileReader），不联网、不上传，保持离线单文件的定位。 */
+
+  function stamp() {
+    var d = new Date();
+    function p(n) { return (n < 10 ? '0' : '') + n; }
+    return '' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' +
+      p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+  }
+
+  function download(filename, text, mime) {
+    try {
+      var blob = new Blob([text], { type: (mime || 'text/plain') + ';charset=utf-8' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function currentResult() {
+    if (!engine || !engine.lastResultSet) return null;
+    var r = engine.lastResultSet;
+    return (r && r.columns && r.columns.length) ? r : null;
+  }
+
+  function binHex(v) {
+    return '0x' + Array.prototype.map.call(v, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+  }
+
+  function cellText(v) {
+    if (v === null || v === undefined) return '';
+    if (v instanceof Uint8Array) return binHex(v);
+    return String(v);
+  }
+
+  function csvCell(v) {
+    var s = cellText(v);
+    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+
+  function exportCSV() {
+    var r = currentResult();
+    if (!r) { toast('还没有可导出的查询结果，先执行一条 SELECT'); return; }
+    var lines = [r.columns.map(csvCell).join(',')];
+    r.values.forEach(function (row) { lines.push(row.map(csvCell).join(',')); });
+    // 前面加 BOM，Excel 打开中文才不乱码
+    var ok = download('mysql-result-' + stamp() + '.csv', '\ufeff' + lines.join('\r\n'), 'text/csv');
+    toast(ok ? '已导出 ' + r.values.length + ' 行 CSV' : '导出失败：当前浏览器不支持本地下载');
+  }
+
+  function exportJSON() {
+    var r = currentResult();
+    if (!r) { toast('还没有可导出的查询结果，先执行一条 SELECT'); return; }
+    var objs = r.values.map(function (row) {
+      var o = {};
+      r.columns.forEach(function (c, i) {
+        var v = row[i];
+        o[c] = (v instanceof Uint8Array) ? binHex(v) : v;
+      });
+      return o;
+    });
+    var ok = download('mysql-result-' + stamp() + '.json', JSON.stringify(objs, null, 2), 'application/json');
+    toast(ok ? '已导出 ' + objs.length + ' 行 JSON' : '导出失败：当前浏览器不支持本地下载');
+  }
+
+  function exportDump() {
+    if (!engine) { toast('引擎还没准备好'); return; }
+    var sql;
+    try { sql = engine.dumpDatabase(engine.current); } catch (e) { sql = null; }
+    if (!sql) { toast('导出失败：找不到当前数据库'); return; }
+    var ok = download('mysql-' + engine.current + '-' + stamp() + '.sql', sql, 'application/sql');
+    toast(ok ? '已导出 ' + engine.current + ' 库的 SQL 脚本' : '导出失败：当前浏览器不支持本地下载');
+  }
+
+  function importSQL(file) {
+    if (!engine) { toast('引擎还没准备好'); return; }
+    var reader = new FileReader();
+    reader.onload = function () {
+      var text = String(reader.result || '');
+      var stmts;
+      try { stmts = Core.splitStatements(text); } catch (e) { stmts = []; }
+      if (!stmts.length) {
+        if (el.importStatus) el.importStatus.textContent = '文件里没有可执行的语句。';
+        toast('文件里没有可执行的语句');
+        return;
+      }
+      line('mysql> /* 导入 ' + file.name + '（' + stmts.length + ' 条语句） */', 'note');
+      var okCount = 0, errCount = 0, errShown = 0;
+      stmts.forEach(function (st) {
+        var blocks;
+        try { blocks = engine.run(st.sql + (st.vertical ? '\\G' : ';')); }
+        catch (e) {
+          errCount++;
+          if (errShown++ < 20) write('ERROR 1105 (HY000): ' + (e && e.message ? e.message : e), 'err');
+          return;
+        }
+        var errs = blocks.filter(function (b) { return b.kind === 'err'; });
+        if (errs.length) {
+          errCount++;
+          if (errShown++ < 20) errs.forEach(function (b) { write(b.text, 'err'); });
+        } else {
+          okCount++;
+        }
+      });
+      var summary = '导入完成：' + okCount + ' 条成功' + (errCount ? '，' + errCount + ' 条失败' : '');
+      if (el.importStatus) {
+        el.importStatus.textContent = summary + (errShown >= 20 ? '（终端里最多显示 20 条错误）' : '');
+      }
+      line('/* ' + summary + ' */', 'note');
+      refreshSidebar();
+      scrollEnd();
+      toast(summary);
+    };
+    reader.onerror = function () { toast('读取文件失败'); };
+    reader.readAsText(file);
+  }
+
   /* ---------------- 事件绑定 ---------------- */
 
   function bind() {
@@ -629,6 +851,18 @@
 
     $('#btn-reconnect').onclick = reconnect;
     $('#btn-clear').onclick = function () { clearScreen(); focusInput(); };
+    // 工具面板
+    $('#btn-csv').onclick = exportCSV;
+    $('#btn-json').onclick = exportJSON;
+    $('#btn-dump').onclick = exportDump;
+    $('#btn-import').onclick = function () { if (el.filePicker) el.filePicker.click(); };
+    if (el.filePicker) {
+      el.filePicker.onchange = function () {
+        var f = this.files && this.files[0];
+        if (f) importSQL(f);
+        this.value = '';   // 清空，允许连续导入同一个文件
+      };
+    }
     $('#btn-side').onclick = function () {
       el.side.classList.toggle('hide');
       this.classList.toggle('on', !el.side.classList.contains('hide'));
@@ -710,6 +944,9 @@
     el.tbllist = $('#tbllist');
     el.tbltitle = $('#tbltitle');
     el.ex = $('#ex-list');
+    el.exNote = $('#ex-note');
+    el.importStatus = $('#import-status');
+    el.filePicker = $('#file-picker');
     el.diff = $('#diff');
     el.help = $('#help');
     el.conn = $('#conn');

@@ -131,6 +131,11 @@ html, body {
 }
 .inputline .prompt { color: var(--term-prompt); white-space: pre; flex: 0 0 auto; }
 .inputline .input { color: #eef2f7; white-space: pre-wrap; word-break: break-all; flex: 1; min-width: 0; }
+/* 输入行语法高亮：只影响显示，真正的输入仍然在隐藏的 <input> 里，不影响输入法 */
+.inputline .input .k { color: #79b8ff; font-weight: 600; }
+.inputline .input .s { color: #6ddd93; }
+.inputline .input .num { color: #f0b95e; }
+.inputline .input .cm { color: #78838f; font-style: italic; }
 .caret {
   display: inline-block; width: 7.5px; margin-left: -1px;
   background: #cfe3ff; color: transparent; border-radius: 1px;
@@ -209,6 +214,7 @@ html, body {
 .lv1 { background: #123324; color: #6ddd93; }
 .lv2 { background: #132c45; color: #79b8ff; }
 .lv3 { background: #33234a; color: #c4a6ff; }
+.lv4 { background: #3a2a14; color: #f0b95e; }
 .exlv .cnt { font-size: 11px; color: var(--fg-dim); font-family: var(--mono); }
 
 .ex {
@@ -253,6 +259,11 @@ html, body {
   background: #0e1218; border: 1px solid var(--border-soft);
   border-radius: 6px; padding: 9px 10px; margin-bottom: 12px;
 }
+
+/* 工具面板（导出结果 / 导出脚本 / 导入脚本） */
+.toolrow { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0 2px; }
+.toolrow .mini { flex: 0 0 auto; }
+.tool-note { font-size: 11px; color: var(--fg-dim); margin: 6px 0 0; line-height: 1.6; }
 pre.help {
   font-family: var(--mono); font-size: 11.5px; line-height: 1.65;
   color: #b9c3cf; white-space: pre-wrap; margin: 0;

@@ -44,46 +44,56 @@ mysql> SELECT city, COUNT(*) AS 人数 FROM users GROUP BY city ORDER BY 人数 
 
 ## 已实现的功能
 
-**DDL** — `CREATE/DROP DATABASE`、`CREATE TABLE`（含 `IF NOT EXISTS`、`CREATE TABLE ... LIKE`）、`DROP TABLE`（支持一次删多张）、`ALTER TABLE` 的 `ADD/DROP/MODIFY/CHANGE/RENAME COLUMN`、`ADD/DROP INDEX|KEY`、`RENAME TABLE`、`TRUNCATE TABLE`
+**DDL** — `CREATE/DROP DATABASE`、`CREATE TABLE`（含 `IF NOT EXISTS`、`CREATE TABLE ... LIKE`、`... AS SELECT`、表级 `AUTO_INCREMENT=N`）、`CREATE/DROP TEMPORARY TABLE`、`DROP TABLE`（支持一次删多张）、`ALTER TABLE` 的 `ADD/DROP/MODIFY/CHANGE/RENAME COLUMN`、`ADD/DROP INDEX|KEY`、`ALTER TABLE ... AUTO_INCREMENT=N`、`RENAME TABLE`、`TRUNCATE TABLE`
 
 **视图** — `CREATE VIEW`、`CREATE OR REPLACE VIEW`、`ALTER VIEW`、`DROP VIEW`。建视图时会像真实 MySQL 一样**立刻校验引用的表和列**，引用错了直接报 `1146`/`1054`，不会留下一个用不了的视图
 
-**DML** — `INSERT`、`INSERT IGNORE`、`INSERT ... SELECT`、`REPLACE INTO`、`UPDATE`（含 `LIMIT`）、`DELETE`（含 `LIMIT`）
+**DML** — `INSERT`、`INSERT IGNORE`、`INSERT ... SELECT`、`INSERT ... SET`、`REPLACE INTO`、`INSERT ... ON DUPLICATE KEY UPDATE`、`UPDATE`（含 `LIMIT`/`ORDER BY`）、`DELETE`（含 `LIMIT`/`ORDER BY`）
 
-**查询** — 多表 `JOIN`（LEFT/RIGHT/INNER/CROSS）、`GROUP BY`/`HAVING`、`ORDER BY`、`LIMIT a,b`、`DISTINCT`、子查询、`UNION`、`CASE WHEN`、`IN`/`BETWEEN`/`LIKE`/`RLIKE`、窗口函数（`RANK`/`ROW_NUMBER`/`DENSE_RANK OVER`）、`EXPLAIN`
+**查询** — 多表 `JOIN`（LEFT/RIGHT/INNER/CROSS）、`GROUP BY`/`HAVING`、`ORDER BY`、`LIMIT a,b`、`DISTINCT`、子查询、派生表、`UNION`、`CASE WHEN`、`IN`/`BETWEEN`/`LIKE`/`RLIKE`、窗口函数（`RANK`/`ROW_NUMBER`/`DENSE_RANK`/`LAG`/`LEAD`/`NTILE` … `OVER`）、CTE（含 `WITH RECURSIVE`）
 
-**元数据** — `SHOW DATABASES`、`SHOW TABLES [LIKE]`、`SHOW FULL TABLES`（`Table_type` 标 `BASE TABLE`/`VIEW`）、`SHOW COLUMNS/FIELDS`、`SHOW CREATE TABLE`、`SHOW CREATE VIEW`、`SHOW INDEX/KEYS`、`SHOW VARIABLES`、`SHOW STATUS`、`SHOW ENGINES`、`SHOW TABLE STATUS`、`SHOW PROCESSLIST`、`SHOW WARNINGS`、`DESC`/`DESCRIBE`
+**执行计划** — `EXPLAIN` 输出 MySQL 的 12 列（`id`/`select_type`/`table`/`type`/`possible_keys`/`key`/`rows`/`Extra` …），另外支持 `EXPLAIN FORMAT=JSON`、`FORMAT=TREE` 与 `EXPLAIN ANALYZE`。`possible_keys` 列出了索引但 `type=ALL` 时，说明底层确实没有建这个二级索引 —— 这是真实反映，不是显示错误
+
+**元数据** — `SHOW DATABASES`（含 `LIKE`/`WHERE`）、`SHOW TABLES [LIKE|WHERE]`、`SHOW FULL TABLES`、`SHOW COLUMNS/FIELDS [LIKE]`（`FULL` 会给出 9 列）、`SHOW CREATE TABLE`、`SHOW CREATE VIEW`、`SHOW INDEX/KEYS`、`SHOW VARIABLES`、`SHOW STATUS`、`SHOW ENGINES`、`SHOW TABLE STATUS`、`SHOW PROCESSLIST`、`SHOW WARNINGS`、`DESC`/`DESCRIBE`（含 `DESC 表 列名` 过滤）
 
 **事务** — `START TRANSACTION`、`BEGIN`、`COMMIT`、`ROLLBACK`、`SAVEPOINT`、`ROLLBACK TO`（回滚是真实生效的）
 
-**变量** — 用户变量 `SET @x = 1` / `SELECT @x`；系统变量 `@@version`、`@@port`；`SET NAMES`、`SET autocommit`、`SET sql_mode`
+**变量** — 用户变量 `SET @x = 1` / `SELECT @x`；`SELECT 列 INTO @变量 FROM ...`；系统变量 `@@version`、`@@port`；`SET NAMES`、`SET autocommit`、`SET sql_mode`
 
-**函数** — 48 个 MySQL 专有函数（`CONCAT_WS`、`GROUP_CONCAT ... SEPARATOR`、`DATE_FORMAT`、`IFNULL`、`FIELD`、`LAST_DAY`、`UUID` 等），加上 SQLite 全部内置函数
+**函数** — 99 个 MySQL 函数（`CONCAT_WS`、`GROUP_CONCAT ... SEPARATOR`、`DATE_FORMAT`、`DATE_ADD(... INTERVAL n unit)`、`DATEDIFF`、`TIMESTAMPDIFF`、`STR_TO_DATE`、`SUBSTRING_INDEX`、`ELT`、`FIND_IN_SET`、`MD5`/`SHA1`/`SHA2`、`STDDEV`/`VARIANCE`、`FORMAT`、`IFNULL`、`FIELD`、`LAST_DAY`、`UUID` 等），加上 SQLite 全部内置函数。变参函数（`CONCAT`/`GREATEST`/`LEAST`/`ELT`/`CHAR`…）按元数逐个注册，不会掉到同名内建函数的语义上去；`CONCAT` 遇 NULL 返回 NULL，与 MySQL 一致
 
-**语法自动转译** — 写 MySQL 写法即可，无需改写：`AUTO_INCREMENT`、`ENGINE=InnoDB`、`DEFAULT CHARSET`、`COLLATE`、`COMMENT`、`ENUM`/`SET`/`JSON` 类型、`UNSIGNED`/`ZEROFILL`、反引号、`LIMIT a, b`、`INSERT ... ON DUPLICATE KEY UPDATE`
+**语法自动转译** — 写 MySQL 写法即可，无需改写：`AUTO_INCREMENT`、`ENGINE=InnoDB`、`DEFAULT CHARSET`、`COLLATE`、`COMMENT`、`ENUM`/`SET`/`JSON` 类型、`UNSIGNED`/`ZEROFILL`、反引号、`LIMIT a, b`、`INSERT ... ON DUPLICATE KEY UPDATE`、`a DIV b`、`a <=> b`、`CONVERT(x, SIGNED)`、`TRIM(LEADING x FROM y)`、`POSITION(x IN y)`、`ISNULL(x)`、`EXTRACT(unit FROM x)`、`DATE_ADD/DATE_SUB(..., INTERVAL n unit)`、`INSERT()` 字符串函数
 
-**学习辅助** — 24 道练习题（基础/进阶/挑战三档，判分忽略大小写与多余空格）、20 条与真实 MySQL 的差异说明、「帮助」面板
+**外键真实生效** — 建表时声明的 `FOREIGN KEY` 会真的拦：插入不存在的父行报 `1452`，删除被引用的父行报 `1451`
+
+**导出与导入（本地，不联网）** — 把上一个查询结果导出成 CSV / JSON，把当前库导出成 `.sql` 脚本，或选择本地 `.sql` 文件导入执行。全程用浏览器内的 Blob / FileReader 完成
+
+**学习辅助** — 46 道练习题（基础 / 进阶 / 挑战 / 实战四档，判分忽略大小写、多余空格、反引号与单字母别名）、与真实 MySQL 的差异说明（「差异」面板）、「帮助」面板；输入行带 SQL 语法高亮
 
 ---
 
 ## 明确不做的
 
-不做的事情会**返回真实原因**，而不是伪装成能跑：
+不做的事情会**返回真实原因**，而不是伪装成能跑。判据很简单：**真实 MySQL 里合法的语句，绝不能报成"语法错误"（1064）**。这条现在是自动化测试守住的（`probe-gaps.cjs` 断言"意外语法错 = 0"）。
 
 | 不做的 | 说明 |
 |---|---|
-| 存储过程 / 触发器 / 事件 | 未实现，报 `1235` |
-| `PREPARE` / `EXECUTE` | 预处理语句未实现 |
+| 存储过程 / 触发器 / 事件 / `CALL` | 未实现，报 `1235` + 原因 |
+| `PREPARE` / `EXECUTE` | 预处理语句未实现，报 `1235` |
 | `GRANT` / `REVOKE` / `CREATE USER` | 不做权限校验，一律以 `root@localhost` 执行 |
 | `LOAD DATA` / `SELECT ... INTO OUTFILE` | 浏览器沙箱内没有文件系统 |
 | `UPDATE/DELETE ... JOIN` | 底层只支持单表写，建议改写成 `WHERE EXISTS (SELECT 1 ...)` |
 | 透过视图写数据 | 报 `1288 ... is not updatable` |
-| `BACKUP DATABASE` / `RESTORE` | MySQL **社区版本身没有**这条 SQL，是企业版组件；社区版靠 `mysqldump` |
+| 分区表、`FULLTEXT`/`SPATIAL` 索引、`MATCH ... AGAINST` | 报 `1235`（不再伪装成 1064） |
+| `ALTER TABLE` 改引擎/删主键/增删外键 | 报 `1235`（只有 `AUTO_INCREMENT=N` 是真的支持的） |
+| 复制、二进制日志、`XA`、`HANDLER`、`INSTALL PLUGIN` | 报 `1235` |
+| **跨库限定名 `db.table`** | 每个库在底层是各自独立的连接，所以 `SELECT ... FROM mysql.user` 会报 `1146`；请先 `USE` 到目标库。这是已知的架构级限制 |
+| `BACKUP DATABASE` / `RESTORE` | MySQL **社区版本身没有**这条 SQL，是企业版组件；社区版靠 `mysqldump`。报 `1064` + 考据 |
 | `mysqldump` | 那是 shell 命令，不是客户端 SQL |
 
-**语义层面的差异**（底层是 SQLite 不是 InnoDB）：没有隔离级别 / 行级锁 / MVCC；`DECIMAL` 不补尾随零；不写 `ORDER BY` 时不保证行序；字符串比较默认区分大小写（MySQL 默认不区分）；`||` 是字符串连接而非逻辑 OR。
+**语义层面的差异**（底层是 SQLite 不是 InnoDB）：没有隔离级别 / 行级锁 / MVCC（`FOR UPDATE` 会被忽略并提示）；`DECIMAL` 不补尾随零；`7/2` 的值是 3.5 但真实 MySQL 会显示成 3.5000；不写 `ORDER BY` 时不保证行序；字符串比较默认区分大小写（MySQL 默认不区分）；`||` 是字符串连接而非逻辑 OR；`EXPLAIN` 的形态对但数据来自底层查询计划而非 InnoDB 优化器。
 
-完整清单见程序内「差异」面板。
+完整清单见程序内「差异」面板（源码里的 `DIFFERENCES` 数组，以它为准）。
 
 ---
 
@@ -93,11 +103,12 @@ mysql> SELECT city, COUNT(*) AS 人数 FROM users GROUP BY city ORDER BY 人数 
 .
 ├── mysql-terminal.html        # 成品（由 src/build.py 生成，勿手改）
 ├── 交接文档.md                # 技术交接 / 维护说明
+├── 功能盘点与可新增清单.md     # 能力盘点 + 已修缺陷登记 + 可新增功能路线
 ├── pack-dist.py               # 打包：HTML + README → dist/*.zip
 ├── src/                       # 源码
 │   ├── template.html          #   HTML 骨架 + 5 个注入占位符
 │   ├── app.css                #   样式
-│   ├── app.js                 #   交互层：终端渲染 / 键盘 / 历史 / 补全 / 侧栏
+│   ├── app.js                 #   交互层：终端渲染 / 键盘 / 高亮 / 导出导入 / 侧栏
 │   ├── mysql-core.js          #   核心层：方言转译 / 元数据 / 排版 / 错误码 / 引擎
 │   ├── build.py               #   构建：全部内联成单文件 HTML
 │   └── tests/                 #   测试
@@ -135,10 +146,11 @@ python pack-dist.py
 
 ```bash
 cd src/tests
-NODE_PATH=../.. node test-core.cjs      # 核心层全量
+NODE_PATH=../.. node test-core.cjs      # 核心层全量（含全部练习题标准答案逐条执行）
 node test-view.cjs                      # 视图全链路
-node test-exercise.cjs                  # 24 题 × 各种等价写法 + 反例 + 串台检查
-node probe-gaps.cjs                     # 特性缺口普查
+node test-exercise.cjs                  # 46 题 × 各种等价写法 + 反例 + 串台检查
+node test-fixes.cjs                     # 修复回归：167 条断言，覆盖每一处修过的缺陷
+node probe-gaps.cjs                     # 特性缺口普查（断言"意外语法错 = 0"）
 ```
 
 **Playwright 侧**（真浏览器）：
@@ -153,9 +165,15 @@ python test-crossbrowser.py     # chromium / firefox / webkit
 python test-extreme.py          # 文件截断 / 损坏兜底
 ```
 
+**没装 Playwright 时的兜底**（零依赖，用本机 Edge 的无头模式）：
+
+```bash
+node e2e-smoke.cjs              # 注入测试脚本 → 真实键盘事件驱动终端 → 抓 DOM 校验
+```
+
 每个脚本把报告写成 `_*_report.txt`（已在 `.gitignore` 中忽略）。
 
-**当前基线**：核心层 `failures = 0`；视图 35+ 用例全过；缺口普查 112 通过 / 13 条预期不支持 / **0 条伪装成 1064 的假语法错**；终端行为、便携性、跨内核、极端情况全部通过。
+**当前基线**：核心层 `failures = 0`；视图全过；练习题 46/46；**修复回归 167 条断言全过**；缺口普查 **171 通过 / 0 条伪装成 1064 的假语法错**；浏览器兜底 26/26。
 
 **改动后的标准动作**：
 
